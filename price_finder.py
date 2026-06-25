@@ -35,6 +35,7 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/1CM9f2xcyIr9l_64hLZ6BiugC1GG
 CREDENTIALS_FILE = "credentials.json"  # OAuth ключ від Google Cloud
 TOKEN_FILE       = "token.json"        # створюється автоматично після 1-го входу
 SERPER_KEY_FILE  = "serper_api_key.txt"  # файл з ключем Serper (поруч зі скриптом)
+SERVICE_ACCOUNT_FILE = "service_account.json"  # ключ сервісного акаунта (пріоритетний вхід)
 ETI_FILE_SEARCH  = "eti_04.03.2026"   # рядок пошуку ETI-файлу на Google Drive
 ETI_TAB_NAME     = "Price_04.03.2026" # назва вкладки у файлі ETI
 ETI_DISCOUNT     = 0.25               # знижка від ETI = 25%
@@ -171,22 +172,39 @@ SCOPES = [
 # 1. GOOGLE АВТОРИЗАЦІЯ
 # ══════════════════════════════════════════════════════════
 
-def get_credentials() -> Credentials:
-    """OAuth2: перший запуск відкриє браузер для входу в Google."""
+def get_credentials():
+    """
+    Авторизація Google. Порядок пріоритету:
+      1) Сервісний акаунт з env-змінної GOOGLE_SERVICE_ACCOUNT_JSON (для хмари/розкладу)
+      2) Сервісний акаунт з файлу service_account.json (локально, будь-який користувач)
+      3) Фолбек: інтерактивний OAuth (credentials.json + браузер) — лише для розробника
+
+    Сервісний акаунт працює без браузера й логіна — головне, щоб таблиця та файл ETI
+    були розшарені на email робота (solar-search@…iam.gserviceaccount.com).
+    """
+    # ── 1 + 2: сервісний акаунт (без інтерактивного входу) ──────────
+    sa_env  = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    sa_path = Path(SERVICE_ACCOUNT_FILE)
+    if sa_env or sa_path.exists():
+        from google.oauth2 import service_account
+        if sa_env:
+            creds = service_account.Credentials.from_service_account_info(
+                json.loads(sa_env), scopes=SCOPES)
+            print(f"{Fore.GREEN}✅ Авторизація через сервісний акаунт (секрет оточення)")
+        else:
+            creds = service_account.Credentials.from_service_account_file(
+                str(sa_path), scopes=SCOPES)
+            print(f"{Fore.GREEN}✅ Авторизація через сервісний акаунт: {sa_path.name}")
+        return creds
+
+    # ── 3: фолбек — інтерактивний OAuth (локальна розробка) ─────────
     creds_path = Path(CREDENTIALS_FILE)
     token_path = Path(TOKEN_FILE)
 
     if not creds_path.exists():
-        print(f"\n{Fore.RED}❌ Файл {CREDENTIALS_FILE} не знайдено!")
-        print(f"\nЯк отримати credentials.json:")
-        print("  1. Зайдіть на https://console.cloud.google.com/")
-        print("  2. Створіть новий проект (або оберіть існуючий)")
-        print("  3. API & Services → Library → Увімкніть:")
-        print("       - Google Sheets API")
-        print("       - Google Drive API")
-        print("  4. Credentials → + Create Credentials → OAuth 2.0 Client IDs")
-        print("  5. Application type: Desktop app → Create → Download JSON")
-        print(f"  6. Перейменуйте у {CREDENTIALS_FILE}, покладіть поряд зі скриптом\n")
+        print(f"\n{Fore.RED}❌ Немає ні {SERVICE_ACCOUNT_FILE}, ні {CREDENTIALS_FILE}!")
+        print(f"   Поклади {SERVICE_ACCOUNT_FILE} поруч зі скриптом (рекомендований спосіб)")
+        print("   або налаштуй OAuth credentials.json.\n")
         sys.exit(1)
 
     creds = None
@@ -203,7 +221,7 @@ def get_credentials() -> Credentials:
             creds = flow.run_local_server(port=0)
         token_path.write_text(creds.to_json())
 
-    print(f"{Fore.GREEN}✅ Авторизовано в Google")
+    print(f"{Fore.GREEN}✅ Авторизовано в Google (OAuth)")
     return creds
 
 
@@ -1111,19 +1129,33 @@ async def run(sheet_url: str):
 # ТОЧКА ВХОДУ
 # ══════════════════════════════════════════════════════════
 
+def resolve_sheet_url(sheet_url: str = "") -> str:
+    """URL таблиці: аргумент → env-змінна SHEET_URL → константа SHEET_URL у файлі."""
+    return (sheet_url or os.environ.get("SHEET_URL", "") or SHEET_URL or "").strip()
+
+
+def run_update(sheet_url: str = "") -> None:
+    """
+    Єдина точка входу для оновлення цін.
+    Використовується з терміналу, Streamlit-застосунку і GitHub Actions.
+    Кидає ValueError при невірному URL; інакше запускає асинхронний run().
+    """
+    url = resolve_sheet_url(sheet_url)
+    if not url:
+        raise ValueError("SHEET_URL порожній: задай посилання на таблицю "
+                         "(env-змінна SHEET_URL або константа у файлі).")
+    if "docs.google.com/spreadsheets" not in url:
+        raise ValueError("SHEET_URL не схожий на посилання Google Sheets "
+                         "(очікується https://docs.google.com/spreadsheets/...).")
+    asyncio.run(run(url))
+
+
 def main():
-    if not SHEET_URL or SHEET_URL.strip() == "":
-        print(f"\n{Fore.RED}❌ SHEET_URL порожній!")
-        print(f"   Відкрийте price_finder.py і вставте посилання на Google Sheets")
-        print(f'   у змінну SHEET_URL у верхній частині файлу.\n')
+    try:
+        run_update()
+    except ValueError as e:
+        print(f"\n{Fore.RED}❌ {e}{Style.RESET_ALL}\n")
         sys.exit(1)
-
-    if "docs.google.com/spreadsheets" not in SHEET_URL:
-        print(f"\n{Fore.RED}❌ SHEET_URL не схожий на Google Sheets посилання.")
-        print(f'   Має починатися з https://docs.google.com/spreadsheets/...\n')
-        sys.exit(1)
-
-    asyncio.run(run(SHEET_URL))
 
 
 if __name__ == "__main__":
