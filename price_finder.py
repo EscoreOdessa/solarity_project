@@ -27,13 +27,14 @@ EScore Energy — Автоматизатор пошуку цін для СЕС
 
 # ╔═══════════════════════════════════════════════════════════╗
 # ║   ↓↓↓  ВСТАВТЕ ПОСИЛАННЯ НА GOOGLE SHEETS СЮДИ  ↓↓↓    ║
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1mUI5tBVxlF0Vti56TH7cW2uKbw-UoMtB7_o4IEbM1M4/edit?usp=sharing"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1CM9f2xcyIr9l_64hLZ6BiugC1GG71AwkWlepUYcux_0/edit?usp=sharing"
 # ║   ↑↑↑  БІЛЬШЕ НІЧОГО НЕ ЗМІНЮВАТИ              ↑↑↑    ║
 # ╚═══════════════════════════════════════════════════════════╝
 
 # ─── Налаштування (змінювати рідко) ────────────────────────
 CREDENTIALS_FILE = "credentials.json"  # OAuth ключ від Google Cloud
 TOKEN_FILE       = "token.json"        # створюється автоматично після 1-го входу
+SERPER_KEY_FILE  = "serper_api_key.txt"  # файл з ключем Serper (поруч зі скриптом)
 ETI_FILE_SEARCH  = "eti_04.03.2026"   # рядок пошуку ETI-файлу на Google Drive
 ETI_TAB_NAME     = "Price_04.03.2026" # назва вкладки у файлі ETI
 ETI_DISCOUNT     = 0.25               # знижка від ETI = 25%
@@ -55,9 +56,9 @@ SKIP_PRICE_SITES = ["alibaba.com", "aliexpress.com", "eti.ua", "olx.ua"]
 
 # Позиції що ІГНОРУЄМО (перевіряємо за частиною назви)
 SKIP_SECTIONS = [
-     "Активний споживач",
-     "Заземлення",
-     "Блискавкозахист",
+     #"Активний споживач",
+     #"Заземлення",
+     #"Блискавкозахист",
      "Витратні Витратні матеріали",
      "БМС",
     # "Основне обладнання",
@@ -72,12 +73,12 @@ SKIP_ITEMS = [
 #     "Інвертор",
 #     "Криплення",
 #     "Облік Енергосервіс",
-   "Активний споживач",
-     "Заземлення",
-     "Блискавкозахист",
-     "Витратні Витратні матеріали"
-     "БМС",
-     "БМС BMS Deye",
+    # "Активний споживач",
+    # "Заземлення",
+    # "Блискавкозахист",
+    "Витратні Витратні матеріали"
+    "БМС",
+    "БМС BMS Deye",
 #     "Додаткові витрати",
 #     "витратні матеріали",
 #     "Доставка обладнання від постачальника", 
@@ -108,13 +109,15 @@ SEARCH_SITES = [
 
 import asyncio
 import io
+import json
 import os
 import re
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 # ── Перевірка залежностей ──────────────────────────────────
 _missing = []
@@ -880,141 +883,141 @@ async def _get_ddg_result_urls(page, query: str, max_results: int = 5) -> List[s
         return []
 
 
-async def web_search_price(item_name: str) -> Optional[Tuple[float, str]]:
-    """
-    Шукає ціну через Google (власний Chromium зі stealth) + виправлена коректність:
-    медіана замість мінімуму, фільтр розстрочки, прапорець при великому розкиді.
-      Крок 1: відкриваємо Google
-      Крок 2: ціни прямо зі сторінки результатів (сніпети)
-      Крок 3: якщо мало — заходимо на перші сайти і знімаємо ціну там
-      Крок 4: медіана + відсів викидів
-    """
+_SERPER_KEY_CACHE = None
+
+
+def get_serper_key() -> str:
+    """Ключ Serper: спершу змінна оточення SERPER_API_KEY, потім файл поруч зі скриптом."""
+    global _SERPER_KEY_CACHE
+    if _SERPER_KEY_CACHE is not None:
+        return _SERPER_KEY_CACHE
+    key = os.environ.get("SERPER_API_KEY", "").strip()
+    if not key:
+        p = Path(__file__).with_name(SERPER_KEY_FILE)
+        if p.exists():
+            key = p.read_text(encoding="utf-8").strip()
+    if key == "ВСТАВ_СЮДИ_КЛЮЧ_SERPER":   # незаповнений шаблон
+        key = ""
+    _SERPER_KEY_CACHE = key
+    return key
+
+
+def _serper_call(endpoint: str, query: str) -> dict:
+    """Один запит до Serper (shopping/search), ринок — Україна. Помилку не валимо."""
+    key = get_serper_key()
+    if not key:
+        return {}
+    req = urllib.request.Request(
+        f"https://google.serper.dev/{endpoint}",
+        data=json.dumps({"q": query, "gl": "ua", "hl": "uk"}).encode("utf-8"),
+        headers={"X-API-KEY": key, "Content-Type": "application/json"},
+    )
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        print(f"  {Fore.YELLOW}playwright не встановлено{Style.RESET_ALL}")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: {e}{Style.RESET_ALL}")
+        return {}
+
+
+def _parse_uah_price(text) -> Optional[float]:
+    """'1 447,18 грн' / '189,38 грн' / '₴2 333' → float. UA: пробіл=тисячі, кома=дробова."""
+    if text is None:
+        return None
+    s = str(text).replace("\xa0", " ")
+    m = re.search(r"\d[\d \.,]*", s)
+    if not m:
+        return None
+    raw = m.group(0).strip().replace(" ", "")
+    if "," in raw and "." in raw:        # напр. 1.447,18 → крапка = тисячі
+        raw = raw.replace(".", "").replace(",", ".")
+    else:
+        raw = raw.replace(",", ".")
+    try:
+        val = float(raw)
+        return val if val > 0 else None
+    except ValueError:
         return None
 
-    try:
-        from playwright_stealth import stealth_async
-        has_stealth = True
-    except ImportError:
-        has_stealth = False
 
-    short_name = re.sub(r'\s+', ' ', item_name).strip()[:80]
-    google_query = f"{short_name} ціна купити Україна"
+def _first_price_in(snippet: str) -> Optional[str]:
+    """Витягує перший шматок схожий на ціну зі сніпета органіки."""
+    if not snippet:
+        return None
+    m = re.search(r"\d[\d \xa0.,]*\s*(?:грн|₴|UAH)", snippet, re.I)
+    return m.group(0) if m else None
+
+
+def _average_prices(prices: List[float], sources: List[str]) -> Tuple[float, str]:
+    """
+    Стійке усереднення. Спершу відсікаємо явні викиди (копійки-брухт і завищені
+    модифікації) — лишаємо смугу навколо медіани. Потім за правилом інструкції
+    відкидаємо мінімум і максимум та усереднюємо. Медіану кладемо у примітку.
+    """
+    prices_str = " | ".join(f"{p:,.2f}" for p in prices)
+    med = _median(prices) or 0
+    band = [p for p in prices if med and 0.4 * med <= p <= 2.5 * med]
+    if len(band) < 2:
+        band = prices[:]
+    band_sorted = sorted(band)
+    if len(band_sorted) >= 5:            # відкидаємо 1 мін + 1 макс (правило інструкції)
+        band_sorted = band_sorted[1:-1]
+    avg = round(sum(band_sorted) / len(band_sorted), 2)
+    med_band = _median(band_sorted) or avg
+
+    # розкид рахуємо по ОЧИЩЕНОМУ кластеру (без брухту), щоб флаг був осмисленим
+    lo, hi = min(band_sorted), max(band_sorted)
+    spread = (hi / lo) if lo > 0 else float("inf")
+    flag = "⚠ ПЕРЕВІРИТИ ВРУЧНУ (великий розкид/мало даних). " if (spread > 3.0 or len(band) < 2) else ""
+    note = (
+        f"{flag}avg={avg:,.2f} грн | медіана={med_band:,.2f} грн "
+        f"({len(band_sorted)} з {len(prices)} проп.) | всі: {prices_str} грн | "
+        + " | ".join(sources)
+    )
+    return avg, note
+
+
+def web_search_price(item_name: str) -> Optional[Tuple[float, str]]:
+    """
+    Ціна через Serper (API Google Shopping) — без браузера і без капчі.
+    Основне джерело — /shopping (ціна готовим полем); фолбек — /search (зі сніпета).
+    """
+    query = re.sub(r"\s+", " ", item_name).strip()
+    print(f"   {Fore.CYAN}Serper: {query[:70]}{Style.RESET_ALL}")
 
     found_prices: List[float] = []
     found_sources: List[str] = []
 
-    from urllib.parse import urlparse as _urlparse
+    # --- 1. Google Shopping (основне джерело) ---
+    for s in _serper_call("shopping", query).get("shopping", []):
+        price = _parse_uah_price(s.get("price"))
+        if price is None:
+            continue
+        site = (s.get("source") or urlparse(s.get("link", "")).netloc).replace("www.", "")
+        if any(skip in site.lower() for skip in SKIP_PRICE_SITES):
+            continue
+        found_prices.append(price)
+        found_sources.append(f"{site}: {s.get('link', '')}")
+        print(f"   {Fore.GREEN}💰 {price:,.2f} грн — {site}{Style.RESET_ALL}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS_BROWSER,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        ctx = await browser.new_context(
-            locale="uk-UA",
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await ctx.new_page()
-        if has_stealth:
-            await stealth_async(page)
-
-        try:
-            print(f"   {Fore.CYAN}Google: {google_query[:70]}{Style.RESET_ALL}")
-            google_url = (
-                f"https://www.google.com/search"
-                f"?q={quote_plus(google_query)}&hl=uk&gl=ua&num=20"
-            )
-            await page.goto(google_url, timeout=30_000, wait_until="domcontentloaded")
-            await asyncio.sleep(2.5)
-            await _wait_if_captcha(page)   # якщо капча — пауза (працює при HEADLESS_BROWSER=False)
-
-            # Крок 2: ціни прямо зі сторінки результатів Google
-            snippet_prices = await _get_prices_from_google_snippets(page)
-            if snippet_prices:
-                print(f"   ✅ Знайдено {len(snippet_prices)} цін у результатах Google:")
-                for price, url in snippet_prices[:MAX_SITES]:
-                    site = _urlparse(url).netloc.replace("www.", "")
-                    if any(skip in site for skip in SKIP_PRICE_SITES):
-                        continue
-                    found_prices.append(price)
-                    found_sources.append(f"{site}: {url}")
-                    print(f"   {Fore.GREEN}💰 {price:,.2f} грн — {site}{Style.RESET_ALL}")
-
-            # Крок 3: якщо зі сторінки результатів мало — заходимо на сайти
-            if len(found_prices) < 2:
-                result_urls = await _get_google_result_urls(page, google_query, max_results=MAX_SITES)
-                if not result_urls:
-                    print(f"   {Fore.YELLOW}Google не повернув посилань{Style.RESET_ALL}")
-                for url in result_urls:
-                    if len(found_prices) >= MAX_SITES:
-                        break
-                    site = _urlparse(url).netloc.replace("www.", "")
-                    if any(skip in site for skip in SKIP_PRICE_SITES):
-                        continue
-                    print(f"   [сайт] {site}: {url[:55]}")
-                    try:
-                        await page.goto(url, timeout=20_000, wait_until="domcontentloaded")
-                        await asyncio.sleep(1.5)
-                        price = await _extract_price_from_product_page(page)
-                        if price:
-                            found_prices.append(price)
-                            found_sources.append(f"{site}: {page.url}")
-                            print(f"   {Fore.GREEN}💰 {price:,.2f} грн — {site}{Style.RESET_ALL}")
-                        else:
-                            print(f"   ⚪ ціну не знайдено")
-                    except Exception as e:
-                        print(f"   ⚠  {e}")
-                    await asyncio.sleep(REQUEST_DELAY)
-        except Exception as e:
-            # Збій на одній позиції не валить весь прогін — лог і йдемо далі
-            print(f"   {Fore.YELLOW}⚠  Помилка під час пошуку: {e}{Style.RESET_ALL}")
-        finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
+    # --- 2. Фолбек: органіка, якщо Shopping порожній ---
+    if not found_prices:
+        print("   ⚪ Shopping порожній — пробую органіку")
+        for o in _serper_call("search", query).get("organic", []):
+            price = _parse_uah_price(_first_price_in(o.get("snippet", "")))
+            if price is None:
+                continue
+            site = urlparse(o.get("link", "")).netloc.replace("www.", "")
+            if any(skip in site.lower() for skip in SKIP_PRICE_SITES):
+                continue
+            found_prices.append(price)
+            found_sources.append(f"{site}: {o.get('link', '')}")
+            print(f"   {Fore.GREEN}💰 {price:,.2f} грн — {site}{Style.RESET_ALL}")
 
     if not found_prices:
         return None
 
-    prices_str = " | ".join(f"{p:,.2f}" for p in found_prices)
-
-    SPREAD_LIMIT = 3.0
-    med = _median(found_prices)
-    band = [p for p in found_prices if med and 0.4 * med <= p <= 2.5 * med]
-    if not band:
-        band = found_prices[:]
-    avg = round(sum(band) / len(band), 2)
-
-    lo, hi = min(found_prices), max(found_prices)
-    spread = (hi / lo) if lo > 0 else float("inf")
-
-    if spread > SPREAD_LIMIT or len(band) < 2:
-        note = (
-            f"⚠ ПЕРЕВІРИТИ ВРУЧНУ: великий розкид ({lo:,.2f}–{hi:,.2f} грн) або мало даних. "
-            f"Орієнтовно avg={avg:,.2f} грн (всі: {prices_str}) | " + " | ".join(found_sources)
-        )
-    else:
-        note = f"avg={avg:,.2f} грн (всі: {prices_str} грн) | " + " | ".join(found_sources)
-
-    return avg, note
+    return _average_prices(found_prices, found_sources)
 
 # КОНЕЦ НОВОЙ ВЕРСИИ
 # ══════════════════════════════════════════════════════════
@@ -1288,6 +1291,13 @@ async def run(sheet_url: str):
     if not eti_ok:
         print(f"   {Fore.YELLOW}ETI пропущено, шукатимемо тільки в інтернеті{Style.RESET_ALL}")
 
+    # Перевірка ключа Serper (інтернет-пошук цін)
+    if get_serper_key():
+        print(f"   {Fore.GREEN}✅ Ключ Serper знайдено — інтернет-пошук активний{Style.RESET_ALL}")
+    else:
+        print(f"   {Fore.RED}❌ Ключ Serper не знайдено! Встав ключ у файл '{SERPER_KEY_FILE}' "
+              f"поруч зі скриптом. Інтернет-пошук цін не працюватиме.{Style.RESET_ALL}")
+
     # 3. Відкрити таблицю
     print(f"\n{Fore.CYAN}── Крок 2: Читання таблиці від інженерів ─────────────{Style.RESET_ALL}")
     spec = SpecSheet(gc, sheet_url)
@@ -1339,7 +1349,7 @@ async def run(sheet_url: str):
 
         # ── Інтернет ──────────────────────────────────────
         print(f"   🌐 Шукаю в інтернеті...")
-        web_result = await web_search_price(full_name)
+        web_result = web_search_price(full_name)
 
         if web_result:
             price, note = web_result

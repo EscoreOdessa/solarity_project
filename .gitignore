@@ -1,6 +1,7 @@
 # === Секрети — НІКОЛИ не комітити і не відправляти на GitHub ===
 credentials.json
 token.json
+serper_api_key.txt
 *.key
 .env
 
