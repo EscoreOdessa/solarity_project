@@ -1,0 +1,16 @@
+# === Секрети — НІКОЛИ не комітити і не відправляти на GitHub ===
+credentials.json
+token.json
+*.key
+.env
+
+# === Python ===
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# === Система / редактор ===
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
