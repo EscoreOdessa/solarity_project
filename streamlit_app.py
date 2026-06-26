@@ -41,6 +41,17 @@ st.caption(
     "і запише їх у таблицю. Заповнюються лише порожні комірки."
 )
 
+# ── Відмітка останнього оновлення (читається з таблиці) ────────────
+_last_update = ""
+try:
+    _last_update = price_finder.get_last_update()
+except Exception:
+    _last_update = ""
+if _last_update:
+    st.info(f"🕓 {_last_update}")
+else:
+    st.caption("🕓 Ще не оновлювалося")
+
 if st.button("🔄 Оновити ціни", type="primary"):
     buf = io.StringIO()
     ok, err = True, None
@@ -53,7 +64,12 @@ if st.button("🔄 Оновити ціни", type="primary"):
 
     log = _ANSI.sub("", buf.getvalue())
     if ok:
-        st.success("✅ Готово! Ціни оновлено в таблиці.")
+        _fresh = ""
+        try:
+            _fresh = price_finder.get_last_update()
+        except Exception:
+            _fresh = ""
+        st.success("✅ Готово! Ціни оновлено в таблиці." + (f"  ({_fresh})" if _fresh else ""))
     else:
         st.error(f"❌ Помилка: {err}")
     if log.strip():

@@ -7,6 +7,7 @@ google-api-python-client
 openpyxl
 rapidfuzz
 colorama
+tzdata
 
 # Примітка: WeasyPrint/reportlab (генерація PDF-КП) свідомо НЕ включені —
 # вони потрібні лише для друку КП локально й ускладнюють збірку в хмарі.
