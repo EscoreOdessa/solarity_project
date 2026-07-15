@@ -119,6 +119,7 @@ import re
 import sys
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse
@@ -667,13 +668,26 @@ def _serper_call(endpoint: str, query: str) -> dict:
         data=json.dumps({"q": query, "gl": "ua", "hl": "uk"}).encode("utf-8"),
         headers={"X-API-KEY": key, "Content-Type": "application/json"},
     )
+    #try:
+     #   with urllib.request.urlopen(req, timeout=20) as r:
+      #      return json.loads(r.read().decode("utf-8"))
+    #except Exception as e:
+     #   print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: {e}{Style.RESET_ALL}")
+      #  return {}
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: HTTP {e.code} — {body}{Style.RESET_ALL}")
+        return {}
     except Exception as e:
         print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: {e}{Style.RESET_ALL}")
         return {}
-
 
 def _parse_uah_price(text) -> Optional[float]:
     """'1 447,18 грн' / '189,38 грн' / '₴2 333' → float. UA: пробіл=тисячі, кома=дробова."""
