@@ -27,7 +27,7 @@ EScore Energy — Автоматизатор пошуку цін для СЕС
 
 # ╔═══════════════════════════════════════════════════════════╗
 # ║   ↓↓↓  ВСТАВТЕ ПОСИЛАННЯ НА GOOGLE SHEETS СЮДИ  ↓↓↓    ║
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1CM9f2xcyIr9l_64hLZ6BiugC1GG71AwkWlepUYcux_0/edit?usp=sharing"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1SRKrMr30UFhB2Z-ucjnPDVGGktcWwk2pGkblD6NbFTg/edit?usp=sharing"
 # ║   ↑↑↑  БІЛЬШЕ НІЧОГО НЕ ЗМІНЮВАТИ              ↑↑↑    ║
 # ╚═══════════════════════════════════════════════════════════╝
 
@@ -36,8 +36,8 @@ CREDENTIALS_FILE = "credentials.json"  # OAuth ключ від Google Cloud
 TOKEN_FILE       = "token.json"        # створюється автоматично після 1-го входу
 SERPER_KEY_FILE  = "serper_api_key.txt"  # файл з ключем Serper (поруч зі скриптом)
 SERVICE_ACCOUNT_FILE = "service_account.json"  # ключ сервісного акаунта (пріоритетний вхід)
-ETI_FILE_SEARCH  = "eti_04.03.2026"   # рядок пошуку ETI-файлу на Google Drive
-ETI_TAB_NAME     = "Price_04.03.2026" # назва вкладки у файлі ETI
+ETI_FILE_SEARCH  = "eti_"   # рядок пошуку ETI-файлу на Google Drive
+ETI_TAB_NAME     = "Price_" # назва вкладки у файлі ETI
 ETI_DISCOUNT     = 0.25               # знижка від ETI = 25%
 SPEC_TAB_NAME    = "Довідник обладнання та цін"
 TIMESTAMP_CELL   = "J1"                       # клітинка з відміткою останнього оновлення
@@ -773,7 +773,7 @@ def web_search_price(item_name: str) -> Optional[Tuple[float, str]]:
 
     return _average_prices(found_prices, found_sources)
 
-# КОНЕЦ НОВОЙ ВЕРСИИ
+
 # ══════════════════════════════════════════════════════════
 # 4. ЧИТАННЯ / ЗАПИС GOOGLE SHEETS
 # ══════════════════════════════════════════════════════════
