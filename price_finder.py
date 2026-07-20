@@ -4,9 +4,12 @@
 EScore Energy — Автоматизатор пошуку цін для СЕС
 =================================================
 Алгоритм:
-  1. Зчитує вкладку «Кошторис_Наявність обладнання» з Google Sheets
+  1. Зчитує вкладку «Довідник обладнання та цін» з Google Sheets
+     (обробляються лише позиції з ПОРОЖНЬОЮ ціною — заповнені комірки не чіпаємо)
   2. Перевіряє прайс ETI (знижка 25%) → бере ціну звідти
-  3. Якщо ETI не знайшов — шукає на 3 Ukrainian сайтах через браузер,
+  3. Якщо ETI не знайшов — перевіряє прайс CHINT Ukraine (найсвіжіший файл
+     з "CHINT" у назві на Drive) → бере ціну звідти
+  4. Якщо і CHINT не знайшов — шукає на 3 Ukrainian сайтах через браузер,
      усереднює і записує в таблицю з посиланням на джерело
 
 ══════════════════════════════════════════════════════════════
@@ -50,6 +53,15 @@ TIMESTAMP_PREFIX = "Останнє оновлення цін: "  # текст-п
 # E.NEXT, DKC) у прайсі ETI немає, тож fuzzy-match давав хибні збіги
 # (усі 15 позицій приліплювались до «Кабельний ввід KVR-OC» = 481.95 грн).
 ETI_SKIP_TYPE_KEYWORDS = ["кабель", "короб", "лоток", "конектор", "коннектор"]
+
+# ── CHINT ПРАЙС-ЛИСТ (додано: другий прайс, аналогічно ETI) ────────
+CHINT_FILE_SEARCH  = "CHINT"        # рядок пошуку CHINT-файлу на Google Drive (беремо найсвіжіший)
+CHINT_TAB_NAME      = "Прайс-Лист"  # назва вкладки з цінами у файлі CHINT
+CHINT_DISCOUNT      = 0.0           # додаткова знижка від CHINT (наразі 0% — своя знижка вже врахована у файлі)
+# CHINT — той самий сегмент обладнання (автомати, ПЗВ, автоматика захисту), що й ETI,
+# тож використовуємо той самий список категорій-винятків, щоб уникнути хибних fuzzy-збігів
+# на кабельно-провідниковій продукції.
+CHINT_SKIP_TYPE_KEYWORDS = ETI_SKIP_TYPE_KEYWORDS
 
 MAX_SITES        = 5                  # перевіряємо перші 20 сайтів (за інструкцією)
 REQUEST_DELAY    = 4.0                # пауза між запитами (сек) — більше = рідше капча
@@ -407,6 +419,184 @@ class ETIPriceList:
             f"| {reason} | {item['name'][:60]}"
         )
         return discounted, item["name"], note
+
+
+# ══════════════════════════════════════════════════════════
+# 2b. CHINT ПРАЙС-ЛИСТ (другий прайс, аналогічно ETI)
+# ══════════════════════════════════════════════════════════
+
+class CHINTPriceList:
+    """Завантажує офіційний прайс CHINT Ukraine з Google Drive і шукає
+    позиції з fuzzy-match. Структура файлу відрізняється від ETI:
+    вкладка «Прайс-Лист», колонки Артикул / Найменування-Тип /
+    Ціна Реалізації з ПДВ / Ціна зі знижкою (знижка вже врахована
+    формулою у самому файлі — беремо готове значення)."""
+
+    def __init__(self, creds: Credentials):
+        self.creds = creds
+        self._items: List[Dict] = []  # [{code, name, price_uah}]
+        self.loaded = False
+
+    # ── Завантаження файлу (беремо найсвіжіший файл з "CHINT" у назві) ──
+    def load(self) -> bool:
+        try:
+            drive = build("drive", "v3", credentials=self.creds)
+
+            q = f"name contains '{CHINT_FILE_SEARCH}' and trashed=false"
+            results = drive.files().list(
+                q=q, orderBy="modifiedTime desc",
+                pageSize=5, fields="files(id,name,modifiedTime)"
+            ).execute()
+
+            files = results.get("files", [])
+            if not files:
+                print(f"{Fore.YELLOW}⚠  CHINT файл '{CHINT_FILE_SEARCH}' не знайдено на Drive")
+                return False
+
+            file_id = files[0]["id"]
+            fname   = files[0]["name"]
+            print(f"📋 CHINT прайс: {fname}")
+
+            req = drive.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(buf, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+
+            buf.seek(0)
+            return self._parse(buf)
+
+        except Exception as ex:
+            print(f"{Fore.YELLOW}⚠  Помилка завантаження CHINT: {ex}")
+            return False
+
+    # ── Парсинг xlsx ───────────────────────────────────────
+    def _parse(self, buf: io.BytesIO) -> bool:
+        try:
+            wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
+
+            # Знайти вкладку "Прайс-Лист" (або найближчу за назвою)
+            ws = None
+            for sname in wb.sheetnames:
+                if CHINT_TAB_NAME.lower() in sname.lower():
+                    ws = wb[sname]
+                    break
+            ws = ws or wb.active
+
+            # Знайти рядок заголовків: "артикул" + "найменування"/"тип" + "ціна"
+            col_code = col_name = col_price = col_price_disc = None
+            header_row_idx = None
+
+            for ridx, row in enumerate(ws.iter_rows(values_only=True), 1):
+                cells = [str(c).lower() if c else "" for c in row]
+                row_text = " ".join(cells)
+
+                if "артикул" in row_text and ("найменування" in row_text or "тип" in row_text) and "ціна" in row_text:
+                    header_row_idx = ridx
+                    for cidx, cv in enumerate(cells):
+                        if not cv:
+                            continue
+                        if col_code is None and "артикул" in cv:
+                            col_code = cidx
+                        if col_name is None and ("найменування" in cv or "тип" in cv):
+                            col_name = cidx
+                        if "ціна" in cv and "знижк" in cv:
+                            col_price_disc = cidx
+                        elif col_price is None and "ціна" in cv:
+                            col_price = cidx
+                    break
+
+            # Пріоритет — колонка з ціною ЗІ ЗНИЖКОЮ (вона вже враховує
+            # відсоток знижки CHINT, налаштований у самому файлі)
+            price_col = col_price_disc if col_price_disc is not None else col_price
+
+            if not header_row_idx or col_name is None or price_col is None:
+                print(f"{Fore.YELLOW}⚠  Не знайдено заголовки у CHINT файлі (вкладка: {ws.title})")
+                print(f"   Очікувані заголовки: 'Артикул', 'Найменування / Тип', 'Ціна ... з ПДВ'")
+                return False
+
+            # Читаємо позиції
+            count = 0
+            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+                name  = row[col_name]  if col_name  < len(row) else None
+                price = row[price_col] if price_col < len(row) else None
+                code  = row[col_code]  if col_code is not None and col_code < len(row) else None
+
+                if not name or not price:
+                    continue
+
+                name_str = str(name).strip()
+                if not name_str:
+                    continue
+
+                try:
+                    price_val = float(
+                        str(price).replace(",", ".").replace(" ", "")
+                                  .replace("\xa0", "").replace("₴", "").replace("грн", "").strip()
+                    )
+                    if price_val > 0:
+                        self._items.append({
+                            "code":  str(code or "").strip(),
+                            "name":  name_str,
+                            "price": price_val,
+                        })
+                        count += 1
+                except (ValueError, TypeError):
+                    pass
+
+            print(f"{Fore.GREEN}✅ CHINT прайс завантажено: {count} позицій")
+            self.loaded = True
+            return True
+
+        except Exception as ex:
+            print(f"{Fore.YELLOW}⚠  Помилка парсингу CHINT: {ex}")
+            return False
+
+    # ── Пошук ціни ─────────────────────────────────────────
+    def find(self, item_name: str, threshold: int = 62
+             ) -> Optional[Tuple[float, str, str]]:
+        """
+        Шукає позицію у прайсі CHINT.
+        Повертає (ціна, назва_в_прайсі, примітка) або None.
+        """
+        if not self.loaded or not self._items:
+            return None
+
+        # 1. Пошук за артикулом (число у дужках 5-8 цифр)
+        code_m = re.search(r'\((\d{5,8})\)', item_name)
+        if code_m:
+            target_code = code_m.group(1)
+            for it in self._items:
+                if it["code"] == target_code:
+                    return self._result(it, reason=f"артикул {target_code}")
+
+        # 2. Fuzzy match за назвою.
+        # token_set_ratio (не partial_ratio, як у ETI) — бо в CHINT каталозі
+        # порядок слів інший ("Модульний авт. вимикач NXB-63 ...", а не
+        # "Автоматичний вимикач CHINT NXB-63 ..."); token_set_ratio ігнорує
+        # порядок і зайві слова (бренд, повторення), тестово підтверджено:
+        # правильні збіги ловить (~76%), а Schneider/ETI/інші серії — ні (0%).
+        names = [it["name"] for it in self._items]
+        match = rfuzz_process.extractOne(
+            item_name, names,
+            scorer=fuzz.token_set_ratio,
+            score_cutoff=threshold,
+        )
+        if match:
+            matched_name, score, idx = match
+            return self._result(self._items[idx], reason=f"fuzzy {score:.0f}%")
+
+        return None
+
+    def _result(self, item: Dict, reason: str) -> Tuple[float, str, str]:
+        price = round(item["price"] * (1 - CHINT_DISCOUNT), 2)
+        extra = f" × {1 - CHINT_DISCOUNT:.2f} (знижка {int(CHINT_DISCOUNT * 100)}%)" if CHINT_DISCOUNT else ""
+        note = (
+            f"CHINT прайс {item['price']:.2f} грн{extra} "
+            f"| {reason} | {item['name'][:60]}"
+        )
+        return price, item["name"], note
 
 
 # ══════════════════════════════════════════════════════════
@@ -978,11 +1168,12 @@ class SpecSheet:
             if any(si.lower() in full_name.lower() for si in SKIP_ITEMS):
                 print(f"   ⛔ Ігнорується: {full_name[:60]}")
                 continue
-# ↓↓↓ Вставка Фильтра пропущенных ячее без цены↓↓↓
-            if not _is_empty_price(price_val):
-                print(f"   ⏭  Пропуск (ціна вже є: {price_val}): {full_name[:60]}")
-                continue
-            # ↑↑↑ КІНЕЦЬ ВСТАВКИ ↑↑↑
+            # ПРИМІТКА: раніше тут рядки з уже заповненою ціною повністю
+            # пропускалися (не потрапляли у список на обробку). Тепер
+            # ОБРОБЛЯЄМО всі рядки — перевірка "чи була ціна вже заповнена"
+            # переїхала у головний цикл run(): там ціну перезаписуємо, ЛИШЕ
+            # якщо знайшовся збіг у прайсі ETI або CHINT; якщо збігу немає —
+            # заповнену клітинку не чіпаємо (веб-пошук для неї не запускаємо).
 
             # Кількість
             try:
@@ -1075,7 +1266,14 @@ async def run(sheet_url: str):
     eti = ETIPriceList(creds)
     eti_ok = eti.load()
     if not eti_ok:
-        print(f"   {Fore.YELLOW}ETI пропущено, шукатимемо тільки в інтернеті{Style.RESET_ALL}")
+        print(f"   {Fore.YELLOW}ETI пропущено, перейдемо одразу до CHINT/інтернету{Style.RESET_ALL}")
+
+    # 2b. CHINT прайс (другий прайс — додано аналогічно ETI)
+    print(f"\n{Fore.CYAN}── Крок 1b: Завантаження прайсу CHINT ────────────────{Style.RESET_ALL}")
+    chint = CHINTPriceList(creds)
+    chint_ok = chint.load()
+    if not chint_ok:
+        print(f"   {Fore.YELLOW}CHINT пропущено, шукатимемо далі за звичною схемою{Style.RESET_ALL}")
 
     # Перевірка ключа Serper (інтернет-пошук цін)
     if get_serper_key():
@@ -1100,7 +1298,7 @@ async def run(sheet_url: str):
 
     print(f"\n{Fore.CYAN}── Крок 3: Пошук цін ({total} позицій) ───────────────────{Style.RESET_ALL}")
 
-    stats = {"eti": 0, "web": 0, "notfound": 0}
+    stats = {"eti": 0, "chint": 0, "web": 0, "notfound": 0, "kept": 0}
 
     for idx, item in enumerate(items, 1):
         name      = item["name"]
@@ -1133,7 +1331,30 @@ async def run(sheet_url: str):
             stats["eti"] += 1
             continue
 
-        # ── Інтернет ──────────────────────────────────────
+        # ── CHINT (другий прайс) ──────────────────────────
+        # Той самий сегмент, що й ETI — теж пропускаємо кабельну групу
+        skip_chint = any(k in item["type"].lower() for k in CHINT_SKIP_TYPE_KEYWORDS)
+        if skip_chint:
+            print(f"   ⏭  Кабельна група — пропускаю CHINT, шукаю в інтернеті")
+        chint_result = chint.find(full_name) if (chint_ok and not skip_chint) else None
+
+        if chint_result:
+            price, matched, note = chint_result
+            print(f"   {Fore.GREEN}✅ CHINT: {price:,.2f} грн{Style.RESET_ALL}")
+            spec.write_result(item, price, "CHINT", prefix + note)
+            stats["chint"] += 1
+            continue
+
+        # ── Немає збігу ні в ETI, ні в CHINT ───────────────
+        # Якщо в клітинці ВЖЕ була ціна (від інженерів або з попереднього
+        # запуску) — не чіпаємо її і НЕ йдемо у веб-пошук: перезаписуємо
+        # лише тоді, коли знайшовся точний збіг у прайсі постачальника.
+        if has_price:
+            print(f"   {Fore.CYAN}↔ Збігу в ETI/CHINT немає — залишаю наявну ціну ({item['price_exist']}) без змін{Style.RESET_ALL}")
+            stats["kept"] += 1
+            continue
+
+        # ── Інтернет (тільки для позицій, що були порожні) ─
         print(f"   🌐 Шукаю в інтернеті...")
         web_result = web_search_price(full_name)
 
@@ -1154,7 +1375,9 @@ async def run(sheet_url: str):
     print(f"\n{Fore.CYAN}{'═'*62}")
     print(f"{Fore.GREEN} ГОТОВО!")
     print(f"{Fore.WHITE}   З прайсу ETI:    {stats['eti']} поз.")
+    print(f"   З прайсу CHINT:  {stats['chint']} поз.")
     print(f"   З інтернету:    {stats['web']} поз.")
+    print(f"   Залишено як є:  {stats['kept']} поз. (ціна вже була, збігу в ETI/CHINT не знайдено)")
     print(f"   Не знайдено:   {stats['notfound']} поз. (уточнити вручну)")
     print(f"{Fore.CYAN}{'═'*62}{Style.RESET_ALL}\n")
 
