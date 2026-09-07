@@ -30,7 +30,7 @@ EScore Energy — Автоматизатор пошуку цін для СЕС
 
 # ╔═══════════════════════════════════════════════════════════╗
 # ║   ↓↓↓  ВСТАВТЕ ПОСИЛАННЯ НА GOOGLE SHEETS СЮДИ  ↓↓↓       ║
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1CM9f2xcyIr9l_64hLZ6BiugC1GG71AwkWlepUYcux_0/edit?usp=sharing"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1g_ICKAssywjzinoyrvTAl9fQ7WbJQHLqj1vasJtuqRU/edit?usp=sharing"
 #            
 #      ↑↑↑  БІЛЬШЕ НІЧОГО НЕ ЗМІНЮВАТИ              ↑↑↑       ║
 # ╚═══════════════════════════════════════════════════════════╝
