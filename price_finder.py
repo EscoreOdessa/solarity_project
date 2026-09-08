@@ -381,7 +381,7 @@ class ETIPriceList:
             return False
 
     # ── Пошук ціни ─────────────────────────────────────────
-    def find(self, item_name: str, threshold: int = 62
+    def find(self, item_name: str, threshold: int = 90
              ) -> Optional[Tuple[float, str, str]]:
         """
         Шукає позицію у прайсі.
@@ -402,7 +402,7 @@ class ETIPriceList:
         names = [it["name"] for it in self._items]
         match = rfuzz_process.extractOne(
             item_name, names,
-            scorer=fuzz.partial_ratio,
+            scorer=fuzz.token_set_ratio,
             score_cutoff=threshold,
         )
         if match:
@@ -554,7 +554,7 @@ class CHINTPriceList:
             return False
 
     # ── Пошук ціни ─────────────────────────────────────────
-    def find(self, item_name: str, threshold: int = 62
+    def find(self, item_name: str, threshold: int = 90
              ) -> Optional[Tuple[float, str, str]]:
         """
         Шукає позицію у прайсі CHINT.
@@ -1324,7 +1324,7 @@ async def run(sheet_url: str):
             print(f"   ⏭  Кабельна група — пропускаю ETI, шукаю в інтернеті")
         eti_result = eti.find(full_name) if (eti_ok and not skip_eti) else None
 
-        if eti_result:
+        if eti_result and (not has_price or "артикул" in eti_result[2]):            
             price, matched, note = eti_result
             print(f"   {Fore.GREEN}✅ ETI: {price:,.2f} грн{Style.RESET_ALL}")
             spec.write_result(item, price, "ETI/ДС-Електро", prefix + note)
@@ -1338,7 +1338,7 @@ async def run(sheet_url: str):
             print(f"   ⏭  Кабельна група — пропускаю CHINT, шукаю в інтернеті")
         chint_result = chint.find(full_name) if (chint_ok and not skip_chint) else None
 
-        if chint_result:
+        if chint_result and (not has_price or "артикул" in chint_result[2]):
             price, matched, note = chint_result
             print(f"   {Fore.GREEN}✅ CHINT: {price:,.2f} грн{Style.RESET_ALL}")
             spec.write_result(item, price, "CHINT", prefix + note)
