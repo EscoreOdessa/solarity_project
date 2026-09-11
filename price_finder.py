@@ -398,16 +398,17 @@ class ETIPriceList:
                 if it["code"] == target_code:
                     return self._result(it, reason=f"артикул {target_code}")
 
-        # 2. Fuzzy match за назвою
-        names = [it["name"] for it in self._items]
-        match = rfuzz_process.extractOne(
-            item_name, names,
-            scorer=fuzz.token_set_ratio,
-            score_cutoff=threshold,
-        )
-        if match:
-            matched_name, score, idx = match
-            return self._result(self._items[idx], reason=f"fuzzy {score:.0f}%")
+        # 2. ТОЧНИЙ збіг за назвою (назви у довіднику приведені до назв прайсу).
+        #    Фаззі-пошук вимкнено: ціну пишемо лише при ПОВНОМУ збігу назви.
+        key = re.sub(r"\s+", " ", str(item_name).strip()).casefold()
+        if not hasattr(self, "_byname"):
+            self._byname = {}
+            for it in self._items:
+                nk = re.sub(r"\s+", " ", str(it["name"]).strip()).casefold()
+                self._byname.setdefault(nk, it)
+        it = self._byname.get(key)
+        if it:
+            return self._result(it, reason="точний збіг назви")
 
         return None
 
@@ -571,21 +572,17 @@ class CHINTPriceList:
                 if it["code"] == target_code:
                     return self._result(it, reason=f"артикул {target_code}")
 
-        # 2. Fuzzy match за назвою.
-        # token_set_ratio (не partial_ratio, як у ETI) — бо в CHINT каталозі
-        # порядок слів інший ("Модульний авт. вимикач NXB-63 ...", а не
-        # "Автоматичний вимикач CHINT NXB-63 ..."); token_set_ratio ігнорує
-        # порядок і зайві слова (бренд, повторення), тестово підтверджено:
-        # правильні збіги ловить (~76%), а Schneider/ETI/інші серії — ні (0%).
-        names = [it["name"] for it in self._items]
-        match = rfuzz_process.extractOne(
-            item_name, names,
-            scorer=fuzz.token_set_ratio,
-            score_cutoff=threshold,
-        )
-        if match:
-            matched_name, score, idx = match
-            return self._result(self._items[idx], reason=f"fuzzy {score:.0f}%")
+        # 2. ТОЧНИЙ збіг за назвою (назви у довіднику приведені до назв прайсу).
+        #    Фаззі-пошук вимкнено: ціну пишемо лише при ПОВНОМУ збігу назви.
+        key = re.sub(r"\s+", " ", str(item_name).strip()).casefold()
+        if not hasattr(self, "_byname"):
+            self._byname = {}
+            for it in self._items:
+                nk = re.sub(r"\s+", " ", str(it["name"]).strip()).casefold()
+                self._byname.setdefault(nk, it)
+        it = self._byname.get(key)
+        if it:
+            return self._result(it, reason="точний збіг назви")
 
         return None
 
@@ -1319,57 +1316,29 @@ async def run(sheet_url: str):
 
         # ── ETI ──────────────────────────────────────────
         # Кабельну продукцію та аксесуари НЕ шукаємо в ETI — одразу в інтернет
-        skip_eti = any(k in item["type"].lower() for k in ETI_SKIP_TYPE_KEYWORDS)
-        if skip_eti:
-            print(f"   ⏭  Кабельна група — пропускаю ETI, шукаю в інтернеті")
-        eti_result = eti.find(full_name) if (eti_ok and not skip_eti) else None
-
-        if eti_result and (not has_price or "артикул" in eti_result[2]):            
+        # ── ETI: лише ТОЧНИЙ збіг назви/артикула ──────────
+        eti_result = eti.find(item["name"]) if eti_ok else None
+        if eti_result:
             price, matched, note = eti_result
-            print(f"   {Fore.GREEN}✅ ETI: {price:,.2f} грн{Style.RESET_ALL}")
+            print(f"   {Fore.GREEN}✅ ETI (точний збіг): {price:,.2f} грн{Style.RESET_ALL}")
             spec.write_result(item, price, "ETI/ДС-Електро", prefix + note)
             stats["eti"] += 1
             continue
 
-        # ── CHINT (другий прайс) ──────────────────────────
-        # Той самий сегмент, що й ETI — теж пропускаємо кабельну групу
-        skip_chint = any(k in item["type"].lower() for k in CHINT_SKIP_TYPE_KEYWORDS)
-        if skip_chint:
-            print(f"   ⏭  Кабельна група — пропускаю CHINT, шукаю в інтернеті")
-        chint_result = chint.find(full_name) if (chint_ok and not skip_chint) else None
-
-        if chint_result and (not has_price or "артикул" in chint_result[2]):
+        # ── CHINT: лише ТОЧНИЙ збіг назви/артикула ────────
+        chint_result = chint.find(item["name"]) if chint_ok else None
+        if chint_result:
             price, matched, note = chint_result
-            print(f"   {Fore.GREEN}✅ CHINT: {price:,.2f} грн{Style.RESET_ALL}")
+            print(f"   {Fore.GREEN}✅ CHINT (точний збіг): {price:,.2f} грн{Style.RESET_ALL}")
             spec.write_result(item, price, "CHINT", prefix + note)
             stats["chint"] += 1
             continue
 
-        # ── Немає збігу ні в ETI, ні в CHINT ───────────────
-        # Якщо в клітинці ВЖЕ була ціна (від інженерів або з попереднього
-        # запуску) — не чіпаємо її і НЕ йдемо у веб-пошук: перезаписуємо
-        # лише тоді, коли знайшовся точний збіг у прайсі постачальника.
-        if has_price:
-            print(f"   {Fore.CYAN}↔ Збігу в ETI/CHINT немає — залишаю наявну ціну ({item['price_exist']}) без змін{Style.RESET_ALL}")
-            stats["kept"] += 1
-            continue
-
-        # ── Інтернет (тільки для позицій, що були порожні) ─
-        print(f"   🌐 Шукаю в інтернеті...")
-        web_result = web_search_price(full_name)
-
-        if web_result:
-            price, note = web_result
-            print(f"   {Fore.GREEN}✅ Середня ціна: {price:,.2f} грн{Style.RESET_ALL}")
-            spec.write_result(item, price, "інтернет", prefix + note)
-            stats["web"] += 1
-        else:
-            not_found = "⚠ Ціну не знайдено на перших 3 сайтах — уточнити вручну"
-            print(f"   {Fore.YELLOW}⚠  Не знайдено{Style.RESET_ALL}")
-            spec.write_result(item, 0, "", prefix + not_found)
-            stats["notfound"] += 1
-
-        await asyncio.sleep(3.0)   # пауза між позиціями — щоб Google рідше показував капчу
+        # ── Точного збігу немає → НІЧОГО не змінюємо ───────
+        # (ні фаззі, ні веб-пошук). Наявну ціну лишаємо як є.
+        print(f"   {Fore.CYAN}↔ Точного збігу в ETI/CHINT немає — лишаю без змін{Style.RESET_ALL}")
+        stats["kept"] += 1
+        continue
 
     # ── Підсумок ───────────────────────────────────────────
     print(f"\n{Fore.CYAN}{'═'*62}")
