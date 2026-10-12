@@ -1,182 +1,110 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EScore Energy — Автоматизатор пошуку цін для СЕС
-=================================================
+EScore Energy — Оновлення цін СЕС з прайсів постачальників
+==========================================================
+Версія 2 (жовтень 2026): ціни беруться ВИКЛЮЧНО з прайсів у папці на Google Диску.
+Інтернет-пошук (Serper / браузер) вимкнено — попередня версія з ним є в історії git.
+
 Алгоритм:
-  1. Зчитує вкладку «Довідник обладнання та цін» з Google Sheets
-     (обробляються лише позиції з ПОРОЖНЬОЮ ціною — заповнені комірки не чіпаємо)
-  2. Перевіряє прайс ETI (знижка 25%) → бере ціну звідти
-  3. Якщо ETI не знайшов — перевіряє прайс CHINT Ukraine (найсвіжіший файл
-     з "CHINT" у назві на Drive) → бере ціну звідти
-  4. Якщо і CHINT не знайшов — шукає на 3 Ukrainian сайтах через браузер,
-     усереднює і записує в таблицю з посиланням на джерело
+  1. У папці з прайсами (PRICES_FOLDER_ID) для кожного постачальника береться
+     НАЙСВІЖІШИЙ файл (ETI, CHINT, БДК/DKC, Kablex — визначаються за назвою файлу).
+  2. Кожен прайс розбирається у словник «артикул → ціна» з урахуванням знижок.
+  3. Для кожної позиції вкладки «Довідник обладнання та цін» визначається прив'язка:
+       • колонка J («Kablex — … (арт. MBN232)», «BDK/ДКС — … (арт. 35264)»,
+         або коротко «Kablex: MBN232», «БДК: 35264», «ETI: 2163518», «CHINT: 131361»);
+       • якщо J порожня — артикул у колонці E (постачальник — з колонки C);
+       • інакше — артикул у назві (6–10 цифр) у прайсі ETI/CHINT або точний збіг назви.
+  4. Знайдено → нова ціна в «Ціна», назва постачальника в C, артикул у E (як у прайсі),
+     джерело (файл, артикул, розрахунок) — у K.
+     Не знайдено / «за запитом» / різка зміна ціни → стара ціна ЛИШАЄТЬСЯ, позиція йде
+     на вкладку «На перевірку» (там же — підказки-кандидати з прайсів).
+  5. Підсвітка A:E перемальовується заново: червоний — не знайдено в прайсах,
+     жовтий — знайдено, але ціну не застосовано (потрібна перевірка).
+  6. У J1 пишеться відмітка часу оновлення.
 
-══════════════════════════════════════════════════════════════
- ОДНОРАЗОВЕ НАЛАШТУВАННЯ (виконати один раз):
-   pip install gspread google-auth google-auth-oauthlib \\
-               google-api-python-client openpyxl rapidfuzz \\
-               colorama playwright playwright-stealth
-   playwright install chromium
-
- НАЛАШТУВАННЯ Google API:
-   1. https://console.cloud.google.com → новий проект
-   2. Увімкніть «Google Sheets API» та «Google Drive API»
-   3. Credentials → OAuth 2.0 Client IDs → Desktop App → Download JSON
-   4. Перейменуйте завантажений файл у credentials.json
-   5. Покладіть credentials.json поруч із цим скриптом
-══════════════════════════════════════════════════════════════
+Запуск: GitHub Actions (розклад раз на 14 днів + кнопка «Оновити ціни» у таблиці).
+Змінні оточення:
+  GOOGLE_SERVICE_ACCOUNT_JSON — ключ сервісного акаунта (обов'язково)
+  SHEET_URL                   — посилання на таблицю
+  DRY_RUN=1                   — нічого не записувати, лише показати зміни
+  SCHEDULED=1                 — запуск за розкладом: пропустити, якщо з
+                                останнього оновлення минуло < MIN_DAYS_BETWEEN днів
 """
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║   ↓↓↓  ВСТАВТЕ ПОСИЛАННЯ НА GOOGLE SHEETS СЮДИ  ↓↓↓       ║
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1g_ICKAssywjzinoyrvTAl9fQ7WbJQHLqj1vasJtuqRU/edit?usp=sharing"
-#            
-#      ↑↑↑  БІЛЬШЕ НІЧОГО НЕ ЗМІНЮВАТИ              ↑↑↑       ║
-# ╚═══════════════════════════════════════════════════════════╝
-
-# ─── Налаштування (змінювати рідко) ────────────────────────
-CREDENTIALS_FILE = "credentials.json"  # OAuth ключ від Google Cloud
-TOKEN_FILE       = "token.json"        # створюється автоматично після 1-го входу
-SERPER_KEY_FILE  = "serper_api_key.txt"  # файл з ключем Serper (поруч зі скриптом)
-SERVICE_ACCOUNT_FILE = "service_account.json"  # ключ сервісного акаунта (пріоритетний вхід)
-ETI_FILE_SEARCH  = "eti_"   # рядок пошуку ETI-файлу на Google Drive
-ETI_TAB_NAME     = "Price_" # назва вкладки у файлі ETI
-ETI_DISCOUNT     = 0.25               # знижка від ETI = 25%
-SPEC_TAB_NAME    = "Довідник обладнання та цін"
-TIMESTAMP_CELL   = "J1"                       # клітинка з відміткою останнього оновлення
-TIMESTAMP_PREFIX = "Останнє оновлення цін: "  # текст-префікс перед датою у клітинці
-
-# Категорії (значення колонки «Тип товару»), для яких НЕ перевіряємо прайс ETI.
-# Уся кабельно-провідникова продукція та кабельні аксесуари (короби, лотки,
-# канали, конектори) одразу йдуть у веб-пошук: потрібних брендів (KOPOS, EKD,
-# E.NEXT, DKC) у прайсі ETI немає, тож fuzzy-match давав хибні збіги
-# (усі 15 позицій приліплювались до «Кабельний ввід KVR-OC» = 481.95 грн).
-ETI_SKIP_TYPE_KEYWORDS = ["кабель", "короб", "лоток", "конектор", "коннектор"]
-
-# ── CHINT ПРАЙС-ЛИСТ (додано: другий прайс, аналогічно ETI) ────────
-CHINT_FILE_SEARCH  = "CHINT"        # рядок пошуку CHINT-файлу на Google Drive (беремо найсвіжіший)
-CHINT_TAB_NAME      = "Прайс-Лист"  # назва вкладки з цінами у файлі CHINT
-CHINT_DISCOUNT      = 0.0           # додаткова знижка від CHINT (наразі 0% — своя знижка вже врахована у файлі)
-# CHINT — той самий сегмент обладнання (автомати, ПЗВ, автоматика захисту), що й ETI,
-# тож використовуємо той самий список категорій-винятків, щоб уникнути хибних fuzzy-збігів
-# на кабельно-провідниковій продукції.
-CHINT_SKIP_TYPE_KEYWORDS = ETI_SKIP_TYPE_KEYWORDS
-
-MAX_SITES        = 5                  # перевіряємо перші 20 сайтів (за інструкцією)
-REQUEST_DELAY    = 4.0                # пауза між запитами (сек) — більше = рідше капча
-HEADLESS_BROWSER = False               # False = видно браузер під час пошуку
-
-# Сайти що ІГНОРУЄМО при пошуку цін
-SKIP_PRICE_SITES = ["alibaba.com", "aliexpress.com", "eti.ua", "olx.ua"]
-# Позиції що ІГНОРУЄМО (перевіряємо за частиною назви)
-SKIP_SECTIONS = [
-     #"Активний споживач",
-     #"Заземлення",
-     #"Блискавкозахист",
-     "Витратні Витратні матеріали",
-     "БМС",
-    # "Основне обладнання",
-    # "Додаткові витрати",
-    # "Кріплення"
-]
-
-# Розділи що ІГНОРУЄМО (ціни фіксують інженери або це роботи)
-SKIP_ITEMS = [
-
-#     "Основне обладнання",
-#     "Сонячні панелі",
-#     "Інвертор",
-#     "Криплення",
-#     "Облік Енергосервіс",
-    # "Активний споживач",
-    # "Заземлення",
-    # "Блискавкозахист",
-    "Витратні Витратні матеріали"
-    "БМС",
-    "БМС BMS Deye",
-#     "Додаткові витрати",
-#     "витратні матеріали",
-#     "Доставка обладнання від постачальника", 
-#     "Сонячний кабель",
-#     "Кріплення Баластна система без підйому кута",
-#     "KBE Solar DB+ 6,00 Q verz EN 50618, IEC 62930, 2 PFG 1169/10.19 black (SW)"
-]
-
-# Сайти для пошуку (порядок = пріоритет)
-SEARCH_SITES = [
-    {"name": "Isolar",       "url": "https://isolar.com.ua/search/?q={q}"},
-    {"name": "Eleksun",      "url": "https://eleksun.com.ua/search/?q={q}"},
-    {"name": "Ecshop",       "url": "https://ecshop.com.ua/ua/search/?text={q}"},
-    {"name": "001",          "url": "https://001.com.ua/ua/search?query={q}"},
-    {"name": "Electrocontrol","url": "https://electrocontrol.com.ua/ua/search?search_term={q}"},
-    {"name": "Electrovoz",   "url": "https://electrovoz.com.ua/ua/search?search_term={q}"},
-    {"name": "E-server",     "url": "https://e-server.com.ua/ua/search?search_term={q}"},
-    {"name": "Sunservis",    "url": "https://sunservis.com.ua/ua/search?search_term={q}"},
-    {"name": "Abatareykin",  "url": "https://abatareykin.kiev.ua/ua/search?search_term={q}"},
-    {"name": "Agart",        "url": "https://agart.ua/ua/search?search_term={q}"},
-    {"name": "Pulsepro",     "url": "https://pulsepro.com.ua/ua/search?search_term={q}"},
-    {"name": "Acko",         "url": "https://agart.ua/ua/search?search_term={q}"},
-    {"name": "Energomotive", "url": "https://energomotive.com.ua/ua/search?search_term={q}"},
-    #{"name": "Amperok",    "url": "https://amperok.com.ua/ua/search?search_term={q}"},
-    {"name": "Cms",          "url": "https://cms.ua/ua/search?search_term={q}"},
-]
-# ───────────────────────────────────────────────────────────
-
-import asyncio
 import io
 import json
 import os
 import re
 import sys
-import time
-import urllib.request
-import urllib.error
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urlparse
 
-# ── Перевірка залежностей ──────────────────────────────────
-_missing = []
-try:
-    import gspread
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
-except ImportError:
-    _missing.append("gspread google-auth google-auth-oauthlib google-api-python-client")
+# ══════════════════════════════════════════════════════════
+# НАЛАШТУВАННЯ
+# ══════════════════════════════════════════════════════════
 
-try:
-    import openpyxl
-except ImportError:
-    _missing.append("openpyxl")
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1g_ICKAssywjzinoyrvTAl9fQ7WbJQHLqj1vasJtuqRU/edit"
 
-try:
-    from rapidfuzz import fuzz
-    from rapidfuzz import process as rfuzz_process
-except ImportError:
-    _missing.append("rapidfuzz")
+# Папка на Google Диску, куди кладуться прайси постачальників
+PRICES_FOLDER_ID = "1S2fDS6V1SZPDP4G6BpWLRBn9SVEf-H8M"
 
-try:
-    from colorama import Fore, Style, init as colorama_init
-    colorama_init(autoreset=True)
-except ImportError:
-    _missing.append("colorama")
-    # Fallback без кольорів
-    class Fore:
-        RED = YELLOW = GREEN = CYAN = WHITE = RESET = ""
-    class Style:
-        BRIGHT = RESET_ALL = ""
+SPEC_TAB_NAME = "Довідник обладнання та цін"
+REVIEW_TAB_NAME = "На перевірку"
+TIMESTAMP_CELL = "J1"
+TIMESTAMP_PREFIX = "Останнє оновлення цін: "
+MAPPING_COL = 9          # J (0-based) — прив'язка позиції до прайсу
+ARTICLE_COL = 4          # E (0-based) — артикул у прайсі (пише скрипт; можна вписати вручну)
+ARTICLE_HEADER = "Артикул"
+HIGHLIGHT_COLS = 5       # A:E — підсвітка рядків
+COLOR_NOT_FOUND = {"red": 0.957, "green": 0.800, "blue": 0.800}   # #F4CCCC
+COLOR_CHECK = {"red": 1.0, "green": 0.949, "blue": 0.800}         # #FFF2CC
+SOURCE_COL = 10          # K (0-based) — джерело ціни (пише скрипт)
+SOURCE_HEADER = "Джерело ціни (авто)"
 
-if _missing:
-    print("❌ Відсутні бібліотеки. Встановіть:")
-    for pkg in _missing:
-        print(f"   pip install {pkg}")
-    print("\nТакож запустіть:")
-    print("   pip install playwright && playwright install chromium")
-    sys.exit(1)
+JUMP_LIMIT = 0.5         # зміна > 50% від поточної ціни (ще не підтвердженої скриптом) → на перевірку
+MIN_DAYS_BETWEEN = 13   # для запуску за розкладом: «раз на два тижні»
+
+# ── Постачальники ─────────────────────────────────────────
+# file_re — як розпізнати файл прайсу за назвою (нижній регістр)
+# label   — що писати в колонку «Постачальник»
+ETI_DISCOUNT = 0.25      # ETI: −25% від «Ціна в грн з ПДВ»
+CHINT_DISCOUNT = 0.0     # CHINT: знижка вже врахована у файлі
+BDK_DISCOUNT = 0.0       # БДК/DKC: знижка від рекомендованої ціни (поки 0%)
+BDK_VAT = 1.2            # БДК: рекомендована ціна в прайсі БЕЗ ПДВ → ×1.2, як у самому файлі
+
+# Kablex: знижка залежить від групи верхнього рівня у прайсі
+KABLEX_GROUP_DISCOUNTS = [
+    ("кабель", 0.37),
+    ("hager", 0.30),
+    ("schneider", 0.25),
+    ("копос", 0.25),
+    ("kopos", 0.25),
+    ("реле напряжения", 0.25),   # ZUBR
+    ("zubr", 0.25),
+]
+# Частина цін Kablex — у EUR/USD. Курс: НБУ на день оновлення; якщо НБУ недоступний — ці значення
+FALLBACK_RATES = {"EUR": 50.5, "USD": 45.1}
+
+SUPPLIERS = {
+    "eti":    {"file_re": r"^eti",             "label": "ETI/ДС-Електро"},
+    "chint":  {"file_re": r"chint",            "label": "CHINT"},
+    "bdk":    {"file_re": r"^(bdk|бдк|dkc)",   "label": "Прайс БДК (DKC)"},
+    "kablex": {"file_re": r"^(kablex|каблекс)", "label": "Kablex"},
+}
+
+# Як постачальник може бути записаний у колонці J / «Постачальник»
+SUPPLIER_ALIASES = [
+    ("kablex", r"kablex|каблекс"),
+    ("bdk",    r"bdk|бдк|дкс|dkc"),
+    ("chint",  r"chint|чінт|чинт"),
+    ("eti",    r"\beti\b|ds-електро|дс-електро|етi|еті"),
+]
+
+# Статуси БДК, які позначаємо на перевірку (ціну все одно беремо)
+BDK_WARN_STATUSES = ("виводиться", "розпродаж")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -185,1227 +113,779 @@ SCOPES = [
 
 
 # ══════════════════════════════════════════════════════════
-# 1. GOOGLE АВТОРИЗАЦІЯ
+# ДОПОМІЖНЕ
+# ══════════════════════════════════════════════════════════
+
+def norm_code(v) -> str:
+    """Артикул → рядок для порівняння: '2163518.0' → '2163518', без пробілів, верхній регістр."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    s = str(v).strip().replace("\xa0", "").replace(" ", "")
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s.upper()
+
+
+def raw_code(v) -> str:
+    """Артикул «в чистому вигляді», як у прайсі: без '.0', дужок і зайвих пробілів."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    s = str(v).strip().strip("()[]").strip()
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s
+
+
+def norm_name(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip()).casefold()
+
+
+def to_float(v) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).replace("\xa0", "").replace(" ", "").replace("₴", "")
+    s = s.replace("грн.", "").replace("грн", "").replace("$", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def fmt(x: float) -> str:
+    return f"{x:,.2f}".replace(",", " ")
+
+
+def kyiv_now() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Kyiv"))
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=3)))
+
+
+def detect_supplier(text: str) -> Optional[str]:
+    t = str(text or "").lower()
+    for key, rx in SUPPLIER_ALIASES:
+        if re.search(rx, t):
+            return key
+    return None
+
+
+@dataclass
+class PriceItem:
+    supplier: str
+    code: str                       # нормалізований (для пошуку)
+    name: str
+    price: Optional[float]          # фінальна ціна (з урахуванням знижки); None = немає ціни
+    base: Optional[float] = None    # ціна з прайсу до знижки
+    discount: float = 0.0
+    status: str = ""                # статус/примітка з прайсу
+    group: str = ""
+    currency: str = "UAH"           # валюта ціни в прайсі
+    rate: float = 1.0               # курс, за яким переведено в грн
+    code_raw: str = ""              # артикул як у прайсі (для колонки E)
+
+    def __post_init__(self):
+        if not self.code_raw:
+            self.code_raw = self.code
+
+
+@dataclass
+class PriceBook:
+    supplier: str
+    file_name: str
+    by_code: Dict[str, PriceItem] = field(default_factory=dict)
+    by_name: Dict[str, PriceItem] = field(default_factory=dict)
+
+    def add(self, it: PriceItem):
+        if it.code and it.code not in self.by_code:
+            self.by_code[it.code] = it
+        nk = norm_name(it.name)
+        if nk and nk not in self.by_name:
+            self.by_name[nk] = it
+
+    def __len__(self):
+        return len(self.by_code) or len(self.by_name)
+
+
+# ══════════════════════════════════════════════════════════
+# ПАРСЕРИ ПРАЙСІВ
+# ══════════════════════════════════════════════════════════
+
+def _rows_xlsx(data: bytes, sheet_hint: str = ""):
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    ws = None
+    for name in wb.sheetnames:
+        if sheet_hint and sheet_hint.lower() in name.lower():
+            ws = wb[name]
+            break
+    ws = ws or wb.worksheets[0]
+    return [list(r) for r in ws.iter_rows(values_only=True)]
+
+
+def _rows_xls(data: bytes):
+    import xlrd
+    sh = xlrd.open_workbook(file_contents=data).sheet_by_index(0)
+    return [sh.row_values(i) for i in range(sh.nrows)]
+
+
+def _rows_any(data: bytes, file_name: str, sheet_hint: str = ""):
+    if file_name.lower().endswith(".xls"):
+        return _rows_xls(data)
+    return _rows_xlsx(data, sheet_hint)
+
+
+def parse_eti(data: bytes, file_name: str) -> PriceBook:
+    """ETI (ДС-Електро): вкладка Price_*, колонки «Код», «Повне найменування», «Ціна в грн. з ПДВ»."""
+    rows = _rows_any(data, file_name, "price_")
+    book = PriceBook("eti", file_name)
+    hdr = c_code = c_name = c_price = None
+    for i, r in enumerate(rows):
+        low = [str(c).lower() if c is not None else "" for c in r]
+        if any(c.strip() == "код" for c in low) and any("найменування" in c for c in low):
+            hdr = i
+            for j, c in enumerate(low):
+                if c_code is None and c.strip() == "код":
+                    c_code = j
+                if c_name is None and "найменування" in c:
+                    c_name = j
+                if c_price is None and "ціна" in c and "грн" in c:
+                    c_price = j
+            break
+    if hdr is None or c_name is None or c_price is None:
+        raise ValueError("ETI: не знайдено рядок заголовків (Код / Повне найменування / Ціна в грн)")
+    for r in rows[hdr + 1:]:
+        name = r[c_name] if c_name < len(r) else None
+        base = to_float(r[c_price]) if c_price < len(r) else None
+        if not name or not base or base <= 0:
+            continue
+        raw = raw_code(r[c_code]) if c_code is not None else ""
+        book.add(PriceItem("eti", norm_code(raw), str(name).strip(),
+                           round(base * (1 - ETI_DISCOUNT), 2), base, ETI_DISCOUNT, code_raw=raw))
+    return book
+
+
+def parse_chint(data: bytes, file_name: str) -> PriceBook:
+    """CHINT: вкладка «Прайс-Лист», «Артикул», «Найменування/Тип», ціна (пріоритет — «зі знижкою»)."""
+    rows = _rows_any(data, file_name, "прайс-лист")
+    book = PriceBook("chint", file_name)
+    hdr = c_code = c_name = c_price = c_disc = None
+    for i, r in enumerate(rows):
+        low = [str(c).lower() if c is not None else "" for c in r]
+        txt = " ".join(low)
+        if "артикул" in txt and ("найменування" in txt or "тип" in txt) and "ціна" in txt:
+            hdr = i
+            for j, c in enumerate(low):
+                if c_code is None and "артикул" in c:
+                    c_code = j
+                if c_name is None and ("найменування" in c or "тип" in c):
+                    c_name = j
+                if "ціна" in c and "знижк" in c:
+                    c_disc = j
+                elif c_price is None and "ціна" in c:
+                    c_price = j
+            break
+    col = c_disc if c_disc is not None else c_price
+    if hdr is None or c_name is None or col is None:
+        raise ValueError("CHINT: не знайдено рядок заголовків (Артикул / Найменування / Ціна)")
+    for r in rows[hdr + 1:]:
+        name = r[c_name] if c_name < len(r) else None
+        base = to_float(r[col]) if col < len(r) else None
+        if not name or not base or base <= 0:
+            continue
+        raw = raw_code(r[c_code]) if c_code is not None else ""
+        book.add(PriceItem("chint", norm_code(raw), str(name).strip(),
+                           round(base * (1 - CHINT_DISCOUNT), 2), base, CHINT_DISCOUNT, code_raw=raw))
+    return book
+
+
+def parse_bdk(data: bytes, file_name: str) -> PriceBook:
+    """БДК/DKC: вкладка «Прейскурант». Ціни у файлі рахуються формулами від комірки знижки,
+    тому беремо «Рекомендована ціна без ПДВ» і рахуємо самі: × (1 − BDK_DISCOUNT) × BDK_VAT."""
+    rows = _rows_any(data, file_name, "прейскурант")
+    book = PriceBook("bdk", file_name)
+    hdr = None
+    cols = {}
+    for i, r in enumerate(rows):
+        low = [str(c).lower() if c is not None else "" for c in r]
+        if any(c.strip() == "артикул" for c in low) and any(c.strip() == "опис" for c in low):
+            hdr = i
+            for j, c in enumerate(low):
+                c = c.strip()
+                if c == "артикул":
+                    cols["code"] = j
+                elif c == "опис":
+                    cols["name"] = j
+                elif c == "статус":
+                    cols["status"] = j
+                elif c == "примітка":
+                    cols["note"] = j
+                elif "рекомендована ціна" in c:
+                    cols["rec"] = j
+            break
+    if hdr is None or not {"code", "name", "rec"} <= cols.keys():
+        raise ValueError("БДК: не знайдено заголовки (Артикул / Опис / Рекомендована ціна)")
+
+    def g(r, k):
+        j = cols.get(k)
+        return r[j] if j is not None and j < len(r) else None
+
+    for r in rows[hdr + 1:]:
+        raw = raw_code(g(r, "code"))
+        code = norm_code(raw)
+        name = g(r, "name")
+        if not code or not name:
+            continue
+        raw = g(r, "rec")
+        base = to_float(raw)
+        status = " / ".join(str(x).strip() for x in (g(r, "status"), g(r, "note")) if x)
+        if base is None and raw:
+            status = (status + " / " if status else "") + str(raw).strip()   # «за запитом»
+        price = round(base * (1 - BDK_DISCOUNT) * BDK_VAT, 2) if base and base > 0 else None
+        book.add(PriceItem("bdk", code, str(name).strip(), price, base, BDK_DISCOUNT, status,
+                           code_raw=raw))
+    return book
+
+
+def _kablex_discount(group: str) -> Tuple[float, bool]:
+    g = group.lower()
+    for key, d in KABLEX_GROUP_DISCOUNTS:
+        if key in g:
+            return d, True
+    return 0.0, False
+
+
+_RATES: Dict[str, float] = {}
+_RATES_SRC = ""
+
+
+def get_rates() -> Tuple[Dict[str, float], str]:
+    """Курс EUR/USD → грн: змінні RATE_EUR/RATE_USD, інакше офіційний курс НБУ на сьогодні,
+    інакше запасні значення FALLBACK_RATES."""
+    global _RATES, _RATES_SRC
+    if _RATES:
+        return _RATES, _RATES_SRC
+    rates, src = dict(FALLBACK_RATES), "запасний курс зі скрипта"
+    env = {k: to_float(os.environ.get(f"RATE_{k}")) for k in ("EUR", "USD")}
+    if all(env.values()):
+        rates, src = env, "курс із налаштувань запуску"
+    else:
+        try:
+            import urllib.request
+            for k in ("EUR", "USD"):
+                u = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode={k}&json"
+                with urllib.request.urlopen(u, timeout=15) as r:
+                    rates[k] = float(json.loads(r.read())[0]["rate"])
+            src = "курс НБУ"
+        except Exception as ex:
+            print(f"⚠ Курс НБУ не отримано ({ex}) — беру запасний: {FALLBACK_RATES}")
+    _RATES, _RATES_SRC = rates, src
+    print(f"💱 {src}: EUR {rates['EUR']:.2f}, USD {rates['USD']:.2f}")
+    return rates, src
+
+
+def _currency_of(fmt_str: str) -> str:
+    f = (fmt_str or "").upper()
+    if "EUR" in f or "€" in f:
+        return "EUR"
+    if "USD" in f or "$" in f:
+        return "USD"
+    return "UAH"
+
+
+def _rows_with_price_currency(data: bytes, file_name: str):
+    """Рядки + валюта кожної комірки (Kablex зберігає валюту лише у форматі комірки: 0.00" EUR")."""
+    if file_name.lower().endswith(".xls"):
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=data, formatting_info=True)
+        sh = wb.sheet_by_index(0)
+        rows, curr = [], []
+        for i in range(sh.nrows):
+            rows.append(sh.row_values(i))
+            cr = []
+            for j in range(sh.ncols):
+                xf = wb.xf_list[sh.cell_xf_index(i, j)]
+                cr.append(_currency_of(wb.format_map[xf.format_key].format_str))
+            curr.append(cr)
+        return rows, curr
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)   # не read_only: потрібні формати
+    ws = wb.worksheets[0]
+    rows, curr = [], []
+    for r in ws.iter_rows():
+        rows.append([c.value for c in r])
+        curr.append([_currency_of(c.number_format) for c in r])
+    return rows, curr
+
+
+def parse_kablex(data: bytes, file_name: str) -> PriceBook:
+    """Kablex: дерево груп з відступами в колонці назви; знижка за групою верхнього рівня.
+    Частина цін — у EUR/USD (видно лише з формату комірки) → переводимо в грн за курсом."""
+    rows, curr = _rows_with_price_currency(data, file_name)
+    book = PriceBook("kablex", file_name)
+    hdr = c_name = c_code = c_price = None
+    for i, r in enumerate(rows):
+        low = [str(c).lower() if c is not None else "" for c in r]
+        if any("номенклатура" in c for c in low) and any("артикул" in c for c in low):
+            hdr = i
+            for j, c in enumerate(low):
+                if c_name is None and "номенклатура" in c and "артикул" not in c:
+                    c_name = j
+                if c_code is None and "артикул" in c:
+                    c_code = j
+            break
+    if hdr is None or c_name is None or c_code is None:
+        raise ValueError("Kablex: не знайдено заголовки (Номенклатура / Артикул)")
+    # ціна — перша колонка праворуч від артикулу, де є числа
+    c_price = c_code + 1
+
+    top_group = ""
+    for ri in range(hdr + 1, len(rows)):
+        r = rows[ri]
+        raw_name = str(r[c_name]) if c_name < len(r) and r[c_name] is not None else ""
+        name = raw_name.strip()
+        if not name:
+            continue
+        indent = len(raw_name) - len(raw_name.lstrip(" "))
+        price = to_float(r[c_price]) if c_price < len(r) else None
+        raw = raw_code(r[c_code]) if c_code < len(r) else ""
+        code = norm_code(raw)
+        if price is None and not code:
+            # рядок-група; верхній рівень — відступ ≤ 4 пробіли (у розділі «Грн» — 4)
+            if indent <= 4 and name.lower() != "грн":
+                top_group = name
+            continue
+        if not price or price <= 0:
+            continue
+        cur = curr[ri][c_price] if c_price < len(curr[ri]) else "UAH"
+        disc, known = _kablex_discount(top_group)
+        status = "" if known else f"група «{top_group}» без налаштованої знижки"
+        rate = 1.0
+        if cur != "UAH":
+            rate = get_rates()[0][cur]
+        book.add(PriceItem("kablex", code, name, round(price * rate * (1 - disc), 2),
+                           price, disc, status, top_group, cur, rate, raw))
+    return book
+
+
+PARSERS = {"eti": parse_eti, "chint": parse_chint, "bdk": parse_bdk, "kablex": parse_kablex}
+
+
+def classify_file(file_name: str) -> Optional[str]:
+    n = file_name.lower()
+    for key, cfg in SUPPLIERS.items():
+        if re.search(cfg["file_re"], n):
+            return key
+    return None
+
+
+# ══════════════════════════════════════════════════════════
+# ЛОГІКА ЗІСТАВЛЕННЯ (без Google — тестується локально)
+# ══════════════════════════════════════════════════════════
+
+@dataclass
+class CatalogRow:
+    row: int            # 1-based номер рядка у вкладці
+    group: str
+    name: str
+    supplier: str
+    price: Optional[float]
+    mapping: str
+    source: str = ""
+    article: str = ""
+
+
+@dataclass
+class Result:
+    row: CatalogRow
+    item: Optional[PriceItem] = None
+    how: str = ""
+    problem: str = ""        # непорожнє → на перевірку
+    new_price: Optional[float] = None
+
+
+_ART_RE = re.compile(r"\(\s*арт\.?\s*([^)]+?)\s*\)\s*$", re.IGNORECASE)
+_SHORT_RE = re.compile(r"^\s*([^:—\-]+?)\s*[:]\s*(\S+)\s*$")
+
+
+def parse_mapping(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """'Kablex — Авт.выкл… (арт. MBN232)' → ('kablex','MBN232'); 'БДК: 35264' → ('bdk','35264')."""
+    t = str(text or "").strip()
+    if not t:
+        return None, None
+    m = _ART_RE.search(t)
+    if m:
+        return detect_supplier(t.split("—")[0]), norm_code(m.group(1))
+    m = _SHORT_RE.match(t)
+    if m:
+        return detect_supplier(m.group(1)), norm_code(m.group(2))
+    return detect_supplier(t), None
+
+
+def match_row(cr: CatalogRow, books: Dict[str, PriceBook]) -> Result:
+    res = Result(cr)
+    sup, code = parse_mapping(cr.mapping)
+
+    if sup or code:
+        if not sup:
+            res.problem = "У колонці J не вказано постачальника"
+            return res
+        book = books.get(sup)
+        if not book:
+            res.problem = f"Прайс «{SUPPLIERS[sup]['label']}» не знайдено в папці"
+            return res
+        it = book.by_code.get(code) if code else None
+        if not it:
+            res.problem = f"Артикул {code or '—'} відсутній у прайсі {book.file_name}"
+            return res
+        res.item, res.how = it, f"арт. {it.code}"
+    elif cr.article.strip():
+        # артикул у колонці E; постачальник — з колонки C (або шукаємо в усіх прайсах)
+        code = norm_code(raw_code(cr.article))
+        sup_col = detect_supplier(cr.supplier)
+        for s in ([sup_col] if sup_col else list(books)):
+            book = books.get(s)
+            if book and code in book.by_code:
+                res.item, res.how = book.by_code[code], f"арт. {code} (колонка E)"
+                break
+        if not res.item:
+            res.problem = f"Артикул {cr.article} (колонка E) не знайдено в прайсах"
+            return res
+    else:
+        # без прив'язки: ETI/CHINT — артикул у назві або точний збіг назви
+        sup_col = detect_supplier(cr.supplier)
+        order = [sup_col] if sup_col in ("eti", "chint") else ([] if sup_col else ["eti", "chint"])
+        for s in order:
+            book = books.get(s)
+            if not book:
+                continue
+            for c in re.findall(r"(?<!\d)(\d{6,10})(?!\d)", cr.name):
+                it = book.by_code.get(c) or book.by_code.get(c.lstrip("0"))
+                if it:
+                    res.item, res.how = it, f"арт. {c} з назви"
+                    break
+            if not res.item:
+                it = book.by_name.get(norm_name(cr.name))
+                if it:
+                    res.item, res.how = it, "точний збіг назви"
+            if res.item:
+                break
+        if not res.item:
+            res.problem = "Немає прив'язки до прайсу"
+            return res
+
+    it = res.item
+    if it.price is None:
+        res.problem = f"У прайсі немає ціни ({it.status or 'порожньо'}) — лишено стару"
+        return res
+    # Захист від хибних прив'язок / упаковка-vs-штука: різка зміна ціни, якої скрипт ще не підтверджував
+    if (cr.price and not cr.source.strip()
+            and abs(it.price - cr.price) / cr.price > JUMP_LIMIT):
+        res.problem = (f"Різка зміна ціни: {fmt(cr.price)} → {fmt(it.price)} "
+                       f"({SUPPLIERS[it.supplier]['label']}, арт. {it.code}). Перевірте прив'язку/одиниці; "
+                       f"щоб прийняти — очистіть стару ціну")
+        return res
+    res.new_price = it.price
+    if it.supplier == "bdk" and any(s in it.status.lower() for s in BDK_WARN_STATUSES):
+        res.problem = f"Статус у прайсі: {it.status}"
+    elif it.supplier == "kablex" and it.status:
+        res.problem = it.status
+    return res
+
+
+def source_note(res: Result, today: str) -> str:
+    it = res.item
+    disc = f" −{round(it.discount * 100)}%" if it.discount else ""
+    vat = " ×1.2 ПДВ" if it.supplier == "bdk" and BDK_VAT != 1 else ""
+    cur = f" {it.currency}×{it.rate:.2f}" if it.currency != "UAH" else ""
+    calc = f"{fmt(it.base)}{cur}{disc}{vat} = {fmt(it.price)}" if it.base else fmt(it.price)
+    book_file = res.item and res.item.supplier
+    extra = f" | {it.status}" if it.status else ""
+    return f"{today} | {SUPPLIERS[book_file]['label']} | {res.how} | {calc}{extra}"
+
+
+def suggest(cr: CatalogRow, books: Dict[str, PriceBook], limit: int = 2) -> List[Tuple[PriceItem, float]]:
+    """Кандидати для позицій без прив'язки — лише підказка на вкладці «На перевірку»."""
+    try:
+        from rapidfuzz import fuzz, process
+    except ImportError:
+        return []
+    q = norm_name(cr.name)
+    q_models = _model_tokens(q)
+    if not q_models:
+        return []                       # без моделі/розміру в назві підказка буде випадковою
+    out = []
+    for book in books.values():
+        names = list(book.by_name.keys())
+        for nk, score, _ in process.extract(q, names, scorer=fuzz.WRatio, limit=25, score_cutoff=70):
+            shared = q_models & _model_tokens(nk)
+            ts = fuzz.token_sort_ratio(q, nk)
+            if shared and ts >= 60:
+                out.append((book.by_name[nk], ts))
+    out.sort(key=lambda x: -x[1])
+    return [(it, min(s, 100)) for it, s in out[:limit]]
+
+
+def _model_tokens(s: str) -> set:
+    """«Модельні» токени: містять цифру і мають ≥3 символи (MBN232, 60x40, 2x4, 35264)."""
+    toks = re.findall(r"[0-9a-zа-яіїє][0-9a-zа-яіїє.,/x×*\-]+", s.lower())
+    out = set()
+    for t in toks:
+        t = t.strip(".,-/").replace("×", "x").replace("*", "x").replace("х", "x").replace(",", ".")
+        if len(t) >= 3 and re.search(r"\d", t):
+            out.add(t)
+    return out
+
+
+def plan(rows: List[CatalogRow], books: Dict[str, PriceBook], with_suggestions=True):
+    results = [match_row(cr, books) for cr in rows]
+    review = []
+    for r in results:
+        if r.problem:
+            cands = suggest(r.row, books) if (with_suggestions and not r.item) else []
+            review.append((r, cands))
+    return results, review
+
+
+# ══════════════════════════════════════════════════════════
+# GOOGLE: АВТОРИЗАЦІЯ, ДИСК, ТАБЛИЦЯ
 # ══════════════════════════════════════════════════════════
 
 def get_credentials():
-    """
-    Авторизація Google. Порядок пріоритету:
-      1) Сервісний акаунт з env-змінної GOOGLE_SERVICE_ACCOUNT_JSON (для хмари/розкладу)
-      2) Сервісний акаунт з файлу service_account.json (локально, будь-який користувач)
-      3) Фолбек: інтерактивний OAuth (credentials.json + браузер) — лише для розробника
-
-    Сервісний акаунт працює без браузера й логіна — головне, щоб таблиця та файл ETI
-    були розшарені на email робота (solar-search@…iam.gserviceaccount.com).
-    """
-    # ── 1 + 2: сервісний акаунт (без інтерактивного входу) ──────────
-    sa_env  = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    sa_path = Path(SERVICE_ACCOUNT_FILE)
-    if sa_env or sa_path.exists():
-        from google.oauth2 import service_account
-        if sa_env:
-            creds = service_account.Credentials.from_service_account_info(
-                json.loads(sa_env), scopes=SCOPES)
-            print(f"{Fore.GREEN}✅ Авторизація через сервісний акаунт (секрет оточення)")
-        else:
-            creds = service_account.Credentials.from_service_account_file(
-                str(sa_path), scopes=SCOPES)
-            print(f"{Fore.GREEN}✅ Авторизація через сервісний акаунт: {sa_path.name}")
-        return creds
-
-    # ── 3: фолбек — інтерактивний OAuth (локальна розробка) ─────────
-    creds_path = Path(CREDENTIALS_FILE)
-    token_path = Path(TOKEN_FILE)
-
-    if not creds_path.exists():
-        print(f"\n{Fore.RED}❌ Немає ні {SERVICE_ACCOUNT_FILE}, ні {CREDENTIALS_FILE}!")
-        print(f"   Поклади {SERVICE_ACCOUNT_FILE} поруч зі скриптом (рекомендований спосіб)")
-        print("   або налаштуй OAuth credentials.json.\n")
-        sys.exit(1)
-
-    creds = None
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("🔄 Оновлюю токен...")
-            creds.refresh(Request())
-        else:
-            print("🌐 Відкриваю браузер для авторизації Google...")
-            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_path.write_text(creds.to_json())
-
-    print(f"{Fore.GREEN}✅ Авторизовано в Google (OAuth)")
-    return creds
+    from google.oauth2 import service_account
+    sa_env = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if sa_env:
+        print("✅ Авторизація: сервісний акаунт (секрет оточення)")
+        return service_account.Credentials.from_service_account_info(json.loads(sa_env), scopes=SCOPES)
+    p = Path("service_account.json")
+    if p.exists():
+        print("✅ Авторизація: service_account.json")
+        return service_account.Credentials.from_service_account_file(str(p), scopes=SCOPES)
+    sys.exit("❌ Немає ключа сервісного акаунта (GOOGLE_SERVICE_ACCOUNT_JSON або service_account.json)")
 
 
-# ══════════════════════════════════════════════════════════
-# 2. ETI ПРАЙС-ЛИСТ
-# ══════════════════════════════════════════════════════════
+def load_books_from_drive(creds) -> Dict[str, PriceBook]:
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    drive = build("drive", "v3", credentials=creds)
+    files = drive.files().list(
+        q=f"'{PRICES_FOLDER_ID}' in parents and trashed=false",
+        orderBy="modifiedTime desc", pageSize=100,
+        fields="files(id,name,mimeType,modifiedTime)",
+    ).execute().get("files", [])
+    if not files:
+        print("⚠ Папка з прайсами порожня або недоступна сервісному акаунту")
 
-class ETIPriceList:
-    """Завантажує прайс ETI з Google Drive і шукає позиції з fuzzy-match."""
+    newest: Dict[str, dict] = {}
+    for f in files:                       # відсортовано від найновішого
+        key = classify_file(f["name"])
+        if key and key not in newest:
+            newest[key] = f
+        elif not key:
+            print(f"   (пропущено — невідомий постачальник: {f['name']})")
 
-    def __init__(self, creds: Credentials):
-        self.creds = creds
-        self._items: List[Dict] = []  # [{code, name, price_uah}]
-        self.loaded = False
-
-    # ── Завантаження файлу ─────────────────────────────────
-    def load(self) -> bool:
+    books = {}
+    for key, f in newest.items():
         try:
-            drive = build("drive", "v3", credentials=self.creds)
-
-            # Знаходимо файл по частині назви
-            q = f"name contains '{ETI_FILE_SEARCH}' and trashed=false"
-            results = drive.files().list(
-                q=q, orderBy="modifiedTime desc",
-                pageSize=5, fields="files(id,name,modifiedTime)"
-            ).execute()
-
-            files = results.get("files", [])
-            if not files:
-                print(f"{Fore.YELLOW}⚠  ETI файл '{ETI_FILE_SEARCH}' не знайдено на Drive")
-                return False
-
-            file_id = files[0]["id"]
-            fname   = files[0]["name"]
-            print(f"📋 ETI прайс: {fname}")
-
-            # Завантажуємо в пам'ять
-            req = drive.files().get_media(fileId=file_id)
+            if f["mimeType"] == "application/vnd.google-apps.spreadsheet":
+                req = drive.files().export_media(
+                    fileId=f["id"],
+                    mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                fname = f["name"] + ".xlsx"
+            else:
+                req = drive.files().get_media(fileId=f["id"])
+                fname = f["name"]
             buf = io.BytesIO()
-            dl = MediaIoBaseDownload(buf, req)
+            dl = MediaIoBaseDownload(buf, req, chunksize=20 * 1024 * 1024)
             done = False
             while not done:
                 _, done = dl.next_chunk()
-
-            buf.seek(0)
-            return self._parse(buf)
-
+            book = PARSERS[key](buf.getvalue(), fname)
+            book.file_name = f["name"]
+            books[key] = book
+            print(f"📋 {SUPPLIERS[key]['label']}: {f['name']} — {len(book)} позицій")
         except Exception as ex:
-            print(f"{Fore.YELLOW}⚠  Помилка завантаження ETI: {ex}")
-            return False
-
-    # ── Парсинг xlsx ───────────────────────────────────────
-    def _parse(self, buf: io.BytesIO) -> bool:
-        try:
-            wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
-
-            # Знайти потрібну вкладку
-            ws = None
-            for sname in wb.sheetnames:
-                if ETI_TAB_NAME.lower() in sname.lower():
-                    ws = wb[sname]
-                    break
-            ws = ws or wb.active
-
-            # Знайти рядок заголовків
-            col_code = col_name = col_price = None
-            header_row_idx = None
-
-            for ridx, row in enumerate(ws.iter_rows(values_only=True), 1):
-                cells = [str(c).lower() if c else "" for c in row]
-                row_text = " ".join(cells)
-
-                if ("найменування" in row_text or "назва" in row_text) and "ціна" in row_text:
-                    header_row_idx = ridx
-                    for cidx, cv in enumerate(cells):
-                        if not cv:
-                            continue
-                        if col_code  is None and "код"              in cv:
-                            col_code = cidx
-                        if col_name  is None and ("найменування" in cv or "назва" in cv):
-                            col_name = cidx
-                        if col_price is None and "грн" in cv and "ціна" in cv:
-                            col_price = cidx
-                    break
-
-            if not header_row_idx or col_name is None or col_price is None:
-                # Fallback: ищем столбцы по другой логике
-                # Часто в ETI файлах первые строки - шапка компании
-                # попробуем найти строку с "Ціна в грн"
-                for ridx, row in enumerate(ws.iter_rows(values_only=True), 1):
-                    cells = [str(c).lower() if c else "" for c in row]
-                    row_text = " ".join(cells)
-                    if "ціна в грн" in row_text or "price" in row_text:
-                        header_row_idx = ridx
-                        for cidx, cv in enumerate(cells):
-                            if not cv: continue
-                            if col_code is None and "код" in cv: col_code = cidx
-                            if col_name is None and ("найменування" in cv or "повне" in cv): col_name = cidx
-                            if col_price is None and "грн" in cv: col_price = cidx
-                        break
-
-            if not header_row_idx or col_name is None or col_price is None:
-                print(f"{Fore.YELLOW}⚠  Не знайдено заголовки у ETI файлі (вкладка: {ws.title})")
-                print(f"   Очікувані заголовки: 'Повне найменування', 'Ціна в грн. з ПДВ'")
-                return False
-
-            # Читаємо позиції
-            count = 0
-            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
-                name  = row[col_name]  if col_name  < len(row) else None
-                price = row[col_price] if col_price < len(row) else None
-                code  = row[col_code]  if col_code is not None and col_code < len(row) else None
-
-                if not name or not price:
-                    continue
-
-                name_str = str(name).strip()
-                if not name_str or name_str.lower() in ("повне найменування", "назва"):
-                    continue
-
-                try:
-                    price_val = float(
-                        str(price).replace(",", ".").replace(" ", "").replace("\xa0", "")
-                    )
-                    if price_val > 0:
-                        self._items.append({
-                            "code":  str(code or "").strip(),
-                            "name":  name_str,
-                            "price": price_val,
-                        })
-                        count += 1
-                except (ValueError, TypeError):
-                    pass
-
-            print(f"{Fore.GREEN}✅ ETI прайс завантажено: {count} позицій")
-            self.loaded = True
-            return True
-
-        except Exception as ex:
-            print(f"{Fore.YELLOW}⚠  Помилка парсингу ETI: {ex}")
-            return False
-
-    # ── Пошук ціни ─────────────────────────────────────────
-    def find(self, item_name: str, threshold: int = 90
-             ) -> Optional[Tuple[float, str, str]]:
-        """
-        Шукає позицію у прайсі.
-        Повертає (ціна_зі_знижкою, назва_в_прайсі, примітка) або None.
-        """
-        if not self.loaded or not self._items:
-            return None
-
-        # 1. Пошук за артикулом (число у дужках 7+ цифр)
-        code_m = re.search(r'\((\d{6,10})\)', item_name)
-        if code_m:
-            target_code = code_m.group(1)
-            for it in self._items:
-                if it["code"] == target_code:
-                    return self._result(it, reason=f"артикул {target_code}")
-
-        # 2. ТОЧНИЙ збіг за назвою (назви у довіднику приведені до назв прайсу).
-        #    Фаззі-пошук вимкнено: ціну пишемо лише при ПОВНОМУ збігу назви.
-        key = re.sub(r"\s+", " ", str(item_name).strip()).casefold()
-        if not hasattr(self, "_byname"):
-            self._byname = {}
-            for it in self._items:
-                nk = re.sub(r"\s+", " ", str(it["name"]).strip()).casefold()
-                self._byname.setdefault(nk, it)
-        it = self._byname.get(key)
-        if it:
-            return self._result(it, reason="точний збіг назви")
-
-        return None
-
-    def _result(self, item: Dict, reason: str) -> Tuple[float, str, str]:
-        discounted = round(item["price"] * (1 - ETI_DISCOUNT), 2)
-        note = (
-            f"ETI прайс {item['price']:.2f} грн "
-            f"× {1 - ETI_DISCOUNT:.2f} (знижка {int(ETI_DISCOUNT * 100)}%) "
-            f"| {reason} | {item['name'][:60]}"
-        )
-        return discounted, item["name"], note
-
-
-# ══════════════════════════════════════════════════════════
-# 2b. CHINT ПРАЙС-ЛИСТ (другий прайс, аналогічно ETI)
-# ══════════════════════════════════════════════════════════
-
-class CHINTPriceList:
-    """Завантажує офіційний прайс CHINT Ukraine з Google Drive і шукає
-    позиції з fuzzy-match. Структура файлу відрізняється від ETI:
-    вкладка «Прайс-Лист», колонки Артикул / Найменування-Тип /
-    Ціна Реалізації з ПДВ / Ціна зі знижкою (знижка вже врахована
-    формулою у самому файлі — беремо готове значення)."""
-
-    def __init__(self, creds: Credentials):
-        self.creds = creds
-        self._items: List[Dict] = []  # [{code, name, price_uah}]
-        self.loaded = False
-
-    # ── Завантаження файлу (беремо найсвіжіший файл з "CHINT" у назві) ──
-    def load(self) -> bool:
-        try:
-            drive = build("drive", "v3", credentials=self.creds)
-
-            q = f"name contains '{CHINT_FILE_SEARCH}' and trashed=false"
-            results = drive.files().list(
-                q=q, orderBy="modifiedTime desc",
-                pageSize=5, fields="files(id,name,modifiedTime)"
-            ).execute()
-
-            files = results.get("files", [])
-            if not files:
-                print(f"{Fore.YELLOW}⚠  CHINT файл '{CHINT_FILE_SEARCH}' не знайдено на Drive")
-                return False
-
-            file_id = files[0]["id"]
-            fname   = files[0]["name"]
-            print(f"📋 CHINT прайс: {fname}")
-
-            req = drive.files().get_media(fileId=file_id)
-            buf = io.BytesIO()
-            dl = MediaIoBaseDownload(buf, req)
-            done = False
-            while not done:
-                _, done = dl.next_chunk()
-
-            buf.seek(0)
-            return self._parse(buf)
-
-        except Exception as ex:
-            print(f"{Fore.YELLOW}⚠  Помилка завантаження CHINT: {ex}")
-            return False
-
-    # ── Парсинг xlsx ───────────────────────────────────────
-    def _parse(self, buf: io.BytesIO) -> bool:
-        try:
-            wb = openpyxl.load_workbook(buf, read_only=True, data_only=True)
-
-            # Знайти вкладку "Прайс-Лист" (або найближчу за назвою)
-            ws = None
-            for sname in wb.sheetnames:
-                if CHINT_TAB_NAME.lower() in sname.lower():
-                    ws = wb[sname]
-                    break
-            ws = ws or wb.active
-
-            # Знайти рядок заголовків: "артикул" + "найменування"/"тип" + "ціна"
-            col_code = col_name = col_price = col_price_disc = None
-            header_row_idx = None
-
-            for ridx, row in enumerate(ws.iter_rows(values_only=True), 1):
-                cells = [str(c).lower() if c else "" for c in row]
-                row_text = " ".join(cells)
-
-                if "артикул" in row_text and ("найменування" in row_text or "тип" in row_text) and "ціна" in row_text:
-                    header_row_idx = ridx
-                    for cidx, cv in enumerate(cells):
-                        if not cv:
-                            continue
-                        if col_code is None and "артикул" in cv:
-                            col_code = cidx
-                        if col_name is None and ("найменування" in cv or "тип" in cv):
-                            col_name = cidx
-                        if "ціна" in cv and "знижк" in cv:
-                            col_price_disc = cidx
-                        elif col_price is None and "ціна" in cv:
-                            col_price = cidx
-                    break
-
-            # Пріоритет — колонка з ціною ЗІ ЗНИЖКОЮ (вона вже враховує
-            # відсоток знижки CHINT, налаштований у самому файлі)
-            price_col = col_price_disc if col_price_disc is not None else col_price
-
-            if not header_row_idx or col_name is None or price_col is None:
-                print(f"{Fore.YELLOW}⚠  Не знайдено заголовки у CHINT файлі (вкладка: {ws.title})")
-                print(f"   Очікувані заголовки: 'Артикул', 'Найменування / Тип', 'Ціна ... з ПДВ'")
-                return False
-
-            # Читаємо позиції
-            count = 0
-            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
-                name  = row[col_name]  if col_name  < len(row) else None
-                price = row[price_col] if price_col < len(row) else None
-                code  = row[col_code]  if col_code is not None and col_code < len(row) else None
-
-                if not name or not price:
-                    continue
-
-                name_str = str(name).strip()
-                if not name_str:
-                    continue
-
-                try:
-                    price_val = float(
-                        str(price).replace(",", ".").replace(" ", "")
-                                  .replace("\xa0", "").replace("₴", "").replace("грн", "").strip()
-                    )
-                    if price_val > 0:
-                        self._items.append({
-                            "code":  str(code or "").strip(),
-                            "name":  name_str,
-                            "price": price_val,
-                        })
-                        count += 1
-                except (ValueError, TypeError):
-                    pass
-
-            print(f"{Fore.GREEN}✅ CHINT прайс завантажено: {count} позицій")
-            self.loaded = True
-            return True
-
-        except Exception as ex:
-            print(f"{Fore.YELLOW}⚠  Помилка парсингу CHINT: {ex}")
-            return False
-
-    # ── Пошук ціни ─────────────────────────────────────────
-    def find(self, item_name: str, threshold: int = 90
-             ) -> Optional[Tuple[float, str, str]]:
-        """
-        Шукає позицію у прайсі CHINT.
-        Повертає (ціна, назва_в_прайсі, примітка) або None.
-        """
-        if not self.loaded or not self._items:
-            return None
-
-        # 1. Пошук за артикулом (число у дужках 5-8 цифр)
-        code_m = re.search(r'\((\d{5,8})\)', item_name)
-        if code_m:
-            target_code = code_m.group(1)
-            for it in self._items:
-                if it["code"] == target_code:
-                    return self._result(it, reason=f"артикул {target_code}")
-
-        # 2. ТОЧНИЙ збіг за назвою (назви у довіднику приведені до назв прайсу).
-        #    Фаззі-пошук вимкнено: ціну пишемо лише при ПОВНОМУ збігу назви.
-        key = re.sub(r"\s+", " ", str(item_name).strip()).casefold()
-        if not hasattr(self, "_byname"):
-            self._byname = {}
-            for it in self._items:
-                nk = re.sub(r"\s+", " ", str(it["name"]).strip()).casefold()
-                self._byname.setdefault(nk, it)
-        it = self._byname.get(key)
-        if it:
-            return self._result(it, reason="точний збіг назви")
-
-        return None
-
-    def _result(self, item: Dict, reason: str) -> Tuple[float, str, str]:
-        price = round(item["price"] * (1 - CHINT_DISCOUNT), 2)
-        extra = f" × {1 - CHINT_DISCOUNT:.2f} (знижка {int(CHINT_DISCOUNT * 100)}%)" if CHINT_DISCOUNT else ""
-        note = (
-            f"CHINT прайс {item['price']:.2f} грн{extra} "
-            f"| {reason} | {item['name'][:60]}"
-        )
-        return price, item["name"], note
-
-
-# ══════════════════════════════════════════════════════════
-# 3. ПОШУК ЦІН В ІНТЕРНЕТІ (Playwright)
-# ══════════════════════════════════════════════════════════
-
-#### НОВАЯ ВЕРСИЯ ПОИСКА В ИНТЕРНЕТЕ "как человек"
-# НОВАЯ ВЕРСИЯ ДЛЯ ПОИСКА ЦЕН — ЧЕРЕЗ РЕАЛЬНЫЙ CHROME (CDP, обход капчи)
-_PRICE_RE = re.compile(
-    r'(?<!\d)(\d[\d\s\xa0]*(?:[.,]\d{1,2})?)\s*(?:грн\.?|UAH|₴)',
-    re.IGNORECASE,
-)
-
-_PRODUCT_PRICE_SELECTORS = [
-    "[data-qaid='product_price']",
-    ".goods-tile__price-value",
-    ".product-price__value",
-    ".product__price",
-    ".price-value",
-    ".price__value",
-    ".price--current",
-    ".current-price",
-    ".buy-price",
-    ".product-price",
-    "[data-qaid='price']",
-    "[class*='ProductPrice']",
-    "[class*='product-price']",
-    "[class*='Price_price']",
-    # широкі — як остання спроба:
-    "span[class*='price']",
-    "div[class*='price']",
-    ".price",
-]
-
-
-def _median(vals: List[float]) -> Optional[float]:
-    s = sorted(vals)
-    n = len(s)
-    if n == 0:
-        return None
-    mid = n // 2
-    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
-
-
-def _parse_price_val(text: str) -> Optional[float]:
-    clean = text.replace("\xa0", " ").strip()
-    m = re.search(r'(\d[\d\s]*(?:[.,]\d{1,2})?)', clean)
-    if not m:
-        return None
-    try:
-        val = float(m.group(1).replace(" ", "").replace(",", "."))
-        if 10 < val < 500_000:
-            return val
-    except ValueError:
-        pass
-    return None
-
-
-async def _extract_price_from_product_page(page) -> Optional[float]:
-    """Знімає ціну з відкритої сторінки товару."""
-    for sel in _PRODUCT_PRICE_SELECTORS:
-        try:
-            els = await page.query_selector_all(sel)
-            for el in els[:3]:
-                txt = await el.text_content() or ""
-                val = _parse_price_val(txt)
-                if val:
-                    return val
-        except Exception:
-            pass
-    # Fallback: медіана чисел-з-грн на сторінці (не мінімум!)
-    try:
-        body = await page.evaluate("() => document.body.innerText")
-        prices = []
-        for m in _PRICE_RE.finditer(body or ""):
-            raw = m.group(1).replace(" ", "").replace("\xa0", "").replace(",", ".")
-            try:
-                val = float(raw)
-                if 10 < val < 500_000:
-                    prices.append(val)
-            except ValueError:
-                pass
-        if prices:
-            return _median(prices)
-    except Exception:
-        pass
-    return None
-
-
-async def _get_google_result_urls(page, query: str, max_results: int = 5) -> List[str]:
-    """Бере посилання на сайти зі сторінки результатів Google."""
-    google_url = f"https://www.google.com/search?q={quote_plus(query)}&hl=uk&gl=ua&num=20"
-    try:
-        await page.goto(google_url, timeout=30_000, wait_until="domcontentloaded")
-        await asyncio.sleep(2.5)
-        await _wait_if_captcha(page)   # якщо капча — пауза, поки пройдеш вручну
-        urls = await page.evaluate("""(maxResults) => {
-            const seen = new Set();
-            const results = [];
-            for (const a of document.querySelectorAll('a[href]')) {
-                const href = a.href;
-                if (!href || !href.startsWith('http')) continue;
-                try {
-                    const host = new URL(href).hostname;
-                    if (host.includes('google.') || host.includes('youtube.') ||
-                        host.includes('gstatic.') || host.includes('googleapis.') ||
-                        host.includes('googletagmanager') || host.includes('doubleclick')) continue;
-                } catch(e) { continue; }
-                if (seen.has(href)) continue;
-                seen.add(href);
-                results.push(href);
-                if (results.length >= maxResults) break;
-            }
-            return results;
-        }""", max_results)
-        return urls or []
-    except Exception as e:
-        print(f"      Google error: {e}")
-        return []
-
-
-async def _get_prices_from_google_snippets(page) -> List[Tuple[float, str]]:
-    """
-    Бере ціни прямо зі сторінки результатів Google (сніпети) — головне джерело.
-    Фільтрує розстрочку («/міс») і бере найбільшу реальну ціну в блоці.
-    """
-    try:
-        results = await page.evaluate("""() => {
-            const found = [];
-            const priceRe = /(\\d[\\d\\s\\u00a0]*(?:[,.]\\d{1,2})?)\\s*(UAH|грн|₴)/gi;
-            const junkRe = /\\/\\s*міс|\\/\\s*мес|\\bміс\\b|\\bмес\\b|на\\s*місяць|у\\s*місяць/i;
-            const blocks = document.querySelectorAll('[data-hveid], .g, .tF2Cxc, [jscontroller]');
-            for (const block of blocks) {
-                const text = block.innerText || '';
-                const link = block.querySelector('a[href]');
-                if (!link) continue;
-                const href = link.href;
-                if (!href || href.includes('google.')) continue;
-                let match;
-                priceRe.lastIndex = 0;
-                const candidates = [];
-                while ((match = priceRe.exec(text)) !== null) {
-                    const raw = match[1].replace(/[\\s\\u00a0]/g, '').replace(',', '.');
-                    const val = parseFloat(raw);
-                    if (!(val > 10 && val < 500000)) continue;
-                    const ctx = text.slice(Math.max(0, match.index - 14),
-                                           match.index + match[0].length + 10);
-                    if (junkRe.test(ctx)) continue;
-                    candidates.push(val);
-                }
-                if (candidates.length) {
-                    found.push({price: Math.max.apply(null, candidates), url: href});
-                }
-            }
-            return found;
-        }""")
-        return [(r["price"], r["url"]) for r in (results or [])]
-    except Exception:
-        return []
-
-
-async def _is_captcha(page) -> bool:
-    """True, якщо Google показав перевірку робота / 'unusual traffic'."""
-    try:
-        if "/sorry/" in (page.url or ""):
-            return True
-        body = (await page.evaluate("() => document.body.innerText") or "").lower()
-        markers = [
-            "unusual traffic", "незвичний трафік", "необычный трафик",
-            "i'm not a robot", "не робот", "captcha", "recaptcha",
-            "підтвердьте, що ви", "подтвердите, что вы",
-        ]
-        return any(m in body for m in markers)
-    except Exception:
-        return False
-
-
-async def _wait_if_captcha(page) -> None:
-    """Якщо з'явилась капча — ставимо паузу, поки людина пройде її у вікні Chrome."""
-    if not await _is_captcha(page):
-        return
-    print(f"   {Fore.YELLOW}⛔ Google показав перевірку робота.{Style.RESET_ALL}")
-    print(f"   {Fore.YELLOW}→ Перейди у вікно Chrome (порт 9222), пройди капчу,{Style.RESET_ALL}")
-    print(f"   {Fore.YELLOW}  потім повернись сюди і натисни Enter...{Style.RESET_ALL}")
-    try:
-        input()
-    except EOFError:
-        await asyncio.sleep(25)
-    try:
-        await page.reload(timeout=30_000, wait_until="domcontentloaded")
-        await asyncio.sleep(2.0)
-    except Exception:
-        pass
-
-
-def _shop_query(item_name: str) -> str:
-    """Чистий короткий запит для пошуку в магазині: прибираємо коди в дужках."""
-    q = re.sub(r'\([^)]*\)', ' ', item_name)   # викидаємо артикули в дужках
-    q = re.sub(r'\s+', ' ', q).strip()
-    return q[:60]
-
-
-async def _get_ddg_result_urls(page, query: str, max_results: int = 5) -> List[str]:
-    """Запас: бере посилання на магазини з HTML-видачі DuckDuckGo (не банить ботів)."""
-    ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query + ' ціна купити Україна')}"
-    try:
-        await page.goto(ddg_url, timeout=30_000, wait_until="domcontentloaded")
-        await asyncio.sleep(1.5)
-        urls = await page.evaluate("""(maxResults) => {
-            const out = []; const seen = new Set();
-            for (const a of document.querySelectorAll('a.result__a, a[href]')) {
-                let href = a.href; if (!href) continue;
-                try {
-                    const u = new URL(href);
-                    if (u.hostname.includes('duckduckgo.com')) {
-                        const real = u.searchParams.get('uddg');
-                        if (real) href = decodeURIComponent(real); else continue;
-                    }
-                } catch(e) { continue; }
-                if (!href.startsWith('http')) continue;
-                if (seen.has(href)) continue; seen.add(href);
-                out.push(href);
-                if (out.length >= maxResults) break;
-            }
-            return out;
-        }""", max_results)
-        return urls or []
-    except Exception as e:
-        print(f"      DuckDuckGo error: {e}")
-        return []
-
-
-_SERPER_KEY_CACHE = None
-
-
-def get_serper_key() -> str:
-    """Ключ Serper: спершу змінна оточення SERPER_API_KEY, потім файл поруч зі скриптом."""
-    global _SERPER_KEY_CACHE
-    if _SERPER_KEY_CACHE is not None:
-        return _SERPER_KEY_CACHE
-    key = os.environ.get("SERPER_API_KEY", "").strip()
-    if not key:
-        p = Path(__file__).with_name(SERPER_KEY_FILE)
-        if p.exists():
-            key = p.read_text(encoding="utf-8").strip()
-    if key == "ВСТАВ_СЮДИ_КЛЮЧ_SERPER":   # незаповнений шаблон
-        key = ""
-    _SERPER_KEY_CACHE = key
-    return key
-
-
-def _serper_call(endpoint: str, query: str) -> dict:
-    """Один запит до Serper (shopping/search), ринок — Україна. Помилку не валимо."""
-    key = get_serper_key()
-    if not key:
-        return {}
-    req = urllib.request.Request(
-        f"https://google.serper.dev/{endpoint}",
-        data=json.dumps({"q": query, "gl": "ua", "hl": "uk"}).encode("utf-8"),
-        headers={"X-API-KEY": key, "Content-Type": "application/json"},
-    )
-    #try:
-     #   with urllib.request.urlopen(req, timeout=20) as r:
-      #      return json.loads(r.read().decode("utf-8"))
-    #except Exception as e:
-     #   print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: {e}{Style.RESET_ALL}")
-      #  return {}
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="replace")[:300]
-        except Exception:
-            pass
-        print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: HTTP {e.code} — {body}{Style.RESET_ALL}")
-        return {}
-    except Exception as e:
-        print(f"   {Fore.YELLOW}⚠ Serper {endpoint}: {e}{Style.RESET_ALL}")
-        return {}
-
-def _parse_uah_price(text) -> Optional[float]:
-    """'1 447,18 грн' / '189,38 грн' / '₴2 333' → float. UA: пробіл=тисячі, кома=дробова."""
-    if text is None:
-        return None
-    s = str(text).replace("\xa0", " ")
-    m = re.search(r"\d[\d \.,]*", s)
-    if not m:
-        return None
-    raw = m.group(0).strip().replace(" ", "")
-    if "," in raw and "." in raw:        # напр. 1.447,18 → крапка = тисячі
-        raw = raw.replace(".", "").replace(",", ".")
-    else:
-        raw = raw.replace(",", ".")
-    try:
-        val = float(raw)
-        return val if val > 0 else None
-    except ValueError:
-        return None
-
-
-def _first_price_in(snippet: str) -> Optional[str]:
-    """Витягує перший шматок схожий на ціну зі сніпета органіки."""
-    if not snippet:
-        return None
-    m = re.search(r"\d[\d \xa0.,]*\s*(?:грн|₴|UAH)", snippet, re.I)
-    return m.group(0) if m else None
-
-
-def _average_prices(prices: List[float], sources: List[str]) -> Tuple[float, str]:
-    """
-    Стійке усереднення. Спершу відсікаємо явні викиди (копійки-брухт і завищені
-    модифікації) — лишаємо смугу навколо медіани. Потім за правилом інструкції
-    відкидаємо мінімум і максимум та усереднюємо. Медіану кладемо у примітку.
-    """
-    prices_str = " | ".join(f"{p:,.2f}" for p in prices)
-    med = _median(prices) or 0
-    band = [p for p in prices if med and 0.4 * med <= p <= 2.5 * med]
-    if len(band) < 2:
-        band = prices[:]
-    band_sorted = sorted(band)
-    if len(band_sorted) >= 5:            # відкидаємо 1 мін + 1 макс (правило інструкції)
-        band_sorted = band_sorted[1:-1]
-    avg = round(sum(band_sorted) / len(band_sorted), 2)
-    med_band = _median(band_sorted) or avg
-
-    # розкид рахуємо по ОЧИЩЕНОМУ кластеру (без брухту), щоб флаг був осмисленим
-    lo, hi = min(band_sorted), max(band_sorted)
-    spread = (hi / lo) if lo > 0 else float("inf")
-    flag = "⚠ ПЕРЕВІРИТИ ВРУЧНУ (великий розкид/мало даних). " if (spread > 3.0 or len(band) < 2) else ""
-    note = (
-        f"{flag}avg={avg:,.2f} грн | медіана={med_band:,.2f} грн "
-        f"({len(band_sorted)} з {len(prices)} проп.) | всі: {prices_str} грн | "
-        + " | ".join(sources)
-    )
-    return avg, note
-
-
-def web_search_price(item_name: str) -> Optional[Tuple[float, str]]:
-    """
-    Ціна через Serper (API Google Shopping) — без браузера і без капчі.
-    Основне джерело — /shopping (ціна готовим полем); фолбек — /search (зі сніпета).
-    """
-    query = re.sub(r"\s+", " ", item_name).strip()
-    print(f"   {Fore.CYAN}Serper: {query[:70]}{Style.RESET_ALL}")
-
-    found_prices: List[float] = []
-    found_sources: List[str] = []
-
-    # --- 1. Google Shopping (основне джерело) ---
-    for s in _serper_call("shopping", query).get("shopping", []):
-        price = _parse_uah_price(s.get("price"))
-        if price is None:
-            continue
-        site = (s.get("source") or urlparse(s.get("link", "")).netloc).replace("www.", "")
-        if any(skip in site.lower() for skip in SKIP_PRICE_SITES):
-            continue
-        found_prices.append(price)
-        found_sources.append(f"{site}: {s.get('link', '')}")
-        print(f"   {Fore.GREEN}💰 {price:,.2f} грн — {site}{Style.RESET_ALL}")
-
-    # --- 2. Фолбек: органіка, якщо Shopping порожній ---
-    if not found_prices:
-        print("   ⚪ Shopping порожній — пробую органіку")
-        for o in _serper_call("search", query).get("organic", []):
-            price = _parse_uah_price(_first_price_in(o.get("snippet", "")))
-            if price is None:
-                continue
-            site = urlparse(o.get("link", "")).netloc.replace("www.", "")
-            if any(skip in site.lower() for skip in SKIP_PRICE_SITES):
-                continue
-            found_prices.append(price)
-            found_sources.append(f"{site}: {o.get('link', '')}")
-            print(f"   {Fore.GREEN}💰 {price:,.2f} грн — {site}{Style.RESET_ALL}")
-
-    if not found_prices:
-        return None
-
-    return _average_prices(found_prices, found_sources)
-
-
-# ══════════════════════════════════════════════════════════
-# 4. ЧИТАННЯ / ЗАПИС GOOGLE SHEETS
-# ══════════════════════════════════════════════════════════
-# Эта функция проверяет заполненны ли ячейки 
-def _is_empty_price(s: str) -> bool:
-    t = (s or "").strip().lower()
-    t = t.replace("\xa0", "").replace(" ", "").replace("грн.", "").replace("грн", "")
-    t = t.replace("$", "").replace("₴", "").replace(",", ".")
-    return t in ("", "0", "0.0", "0.00", "-", "—", "n/a")
-# Окончена функция проверки пустых ячеек
-
-
-class SpecSheet:
-    """Читає вкладку «Кошторис_Наявність обладнання» і записує ціни."""
-
-    # Ключові слова для автодетекту колонок
-    _COL_KEYS = {
-        "type":     ["тип товару", "тип", "категорія"],
-        "name":     ["найменування", "назва", "обладнання"],
-        "supplier": ["постачальник", "виробник"],
-        "qty":      ["кіл-сть", "кількість", "к-сть", "к-ть"],
-        "unit":     ["од. вим.", "одиниця", "од.вим"],
-        "price":    ["ціна з пдв", "ціна", "price"],
-        "total":    ["вартість з пдв", "вартість", "сума"],
-        "notes":    ["наявність", "примітк", "коментар", "джерело", "note"],
+            print(f"⚠ Не вдалося прочитати {f['name']}: {ex}")
+    for key in SUPPLIERS:
+        if key not in books:
+            print(f"⚠ Прайс «{SUPPLIERS[key]['label']}» у папці не знайдено — ці позиції не оновлюються")
+    return books
+
+
+def open_sheet(creds, url: str):
+    import gspread
+    gc = gspread.Client(auth=creds)
+    wb = gc.open_by_url(url)
+    ws = next((s for s in wb.worksheets() if SPEC_TAB_NAME.lower() in s.title.lower()), None)
+    if ws is None:
+        sys.exit(f"❌ Вкладку «{SPEC_TAB_NAME}» не знайдено")
+    return wb, ws
+
+
+def read_catalog(values: List[List]) -> Tuple[List[CatalogRow], Dict[str, int]]:
+    """values — усі значення вкладки (рядки списками). Перший рядок — заголовки."""
+    head = [str(c).strip().lower() for c in values[0]]
+
+    def col(*keys, default=None):
+        for k in keys:
+            for j, h in enumerate(head):
+                if h.startswith(k):
+                    return j
+        return default
+
+    cols = {
+        "group": col("група", default=0),
+        "name": col("найменування", default=1),
+        "supplier": col("постачальник", default=2),
+        "price": col("ціна", default=3),
     }
-
-    def __init__(self, gc: gspread.Client, url: str):
-        self.gc   = gc
-        self.url  = url
-        self.ws   = None
-        self.cols: Dict[str, int] = {}   # field → 0-based column index
-        self._header_row = 0             # 1-based
-
-    # ── Відкрити таблицю ───────────────────────────────────
-    def open(self) -> bool:
-        try:
-            wb = self.gc.open_by_url(self.url)
-        except gspread.exceptions.SpreadsheetNotFound:
-            print(f"{Fore.RED}❌ Таблицю не знайдено. Перевірте SHEET_URL і доступ.")
-            return False
-        except gspread.exceptions.APIError as ex:
-            print(f"{Fore.RED}❌ Google API помилка: {ex}")
-            return False
-
-        # Знайти вкладку
-        ws = None
-        for sheet in wb.worksheets():
-            if SPEC_TAB_NAME.lower() in sheet.title.lower():
-                ws = sheet
-                break
-
-        if ws is None:
-            names = [s.title for s in wb.worksheets()]
-            print(f"{Fore.RED}❌ Вкладку '{SPEC_TAB_NAME}' не знайдено.")
-            print(f"   Доступні вкладки: {', '.join(names)}")
-            return False
-
-        self.ws = ws
-        print(f"{Fore.GREEN}✅ Відкрито вкладку: «{ws.title}»")
-        return self._detect_columns()
-
-    # ── Записати відмітку часу останнього оновлення ────────
-    def write_timestamp(self) -> str:
-        """Пише у клітинку TIMESTAMP_CELL дату-час останнього оновлення (київський час)."""
-        from datetime import datetime, timezone, timedelta
-        try:
-            from zoneinfo import ZoneInfo
-            now = datetime.now(ZoneInfo("Europe/Kyiv"))
-        except Exception:
-            now = datetime.now(timezone(timedelta(hours=3)))   # фолбек: Київ влітку = UTC+3
-        stamp = now.strftime("%d.%m.%Y %H:%M")
-        try:
-            self.ws.update_acell(TIMESTAMP_CELL, f"{TIMESTAMP_PREFIX}{stamp}")
-            print(f"{Fore.GREEN}🕓 Відмітку оновлення записано: {stamp}{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"{Fore.YELLOW}⚠ Відмітку часу не записано: {e}{Style.RESET_ALL}")
-        return stamp
-
-    # ── Автодетект колонок ─────────────────────────────────
-    def _detect_columns(self) -> bool:
-        all_vals = self.ws.get_all_values()
-
-        for ridx, row in enumerate(all_vals):
-            low = [c.lower().strip() for c in row]
-            row_text = " ".join(low)
-
-            has_name  = any("найменування" in c or "назва" in c for c in low)
-            has_price = any("ціна" in c for c in low)
-
-            if has_name and has_price:
-                self._header_row = ridx + 1
-                for field, keywords in self._COL_KEYS.items():
-                    for cidx, cv in enumerate(low):
-                        if any(kw in cv for kw in keywords) and field not in self.cols:
-                            self.cols[field] = cidx
-                break
-
-        if not self._header_row:
-            print(f"{Fore.RED}❌ Не знайдено рядок заголовків у вкладці.")
-            print("   Очікуються колонки: Найменування, Кіл-сть, Ціна з ПДВ")
-            return False
-
-        print(f"📌 Заголовки у рядку {self._header_row}")
-        # Показуємо які колонки знайдено
-        col_letters = {
-            f: gspread.utils.rowcol_to_a1(1, v + 1)[:-1]
-            for f, v in self.cols.items()
-        }
-        print(f"   Знайдені колонки: {col_letters}")
-
-        # Перевіряємо критичні колонки
-        if "price" not in self.cols:
-            print(f"   {Fore.RED}❌ КРИТИЧНО: колонку 'Ціна' не знайдено — запис неможливий!")
-            print(f"      Перевірте заголовки у вкладці '{SPEC_TAB_NAME}'{Style.RESET_ALL}")
-            return False
-        if "name" not in self.cols:
-            print(f"   {Fore.RED}❌ КРИТИЧНО: колонку 'Найменування' не знайдено{Style.RESET_ALL}")
-            return False
-
-        return True
-
-    # ── Отримати список позицій ───────────────────────────
-    def get_items(self) -> List[Dict]:
-        """
-        Повертає позиції з кількістю та ціною.
-        Пропускає розділи зі SKIP_SECTIONS та позиції зі SKIP_ITEMS.
-        """
-        all_vals  = self.ws.get_all_values()
-        items     = []
-
-        col_type  = self.cols.get("type",     0)
-        col_name  = self.cols.get("name",     1)
-        col_supp  = self.cols.get("supplier", 2)
-        col_qty   = self.cols.get("qty",      3)
-        col_unit  = self.cols.get("unit",     4)
-        col_price = self.cols.get("price",    5)
-        col_total = self.cols.get("total",    6)
-        col_notes = self.cols.get("notes",    7)
-
-        current_section = ""
-        skip_section    = False
-
-        for ridx, row in enumerate(all_vals):
-            if ridx < self._header_row:          # пропускаємо шапку
-                continue
-
-            def cell(c: int) -> str:
-                return str(row[c]).strip() if c < len(row) else ""
-
-            type_val  = cell(col_type)
-            name_val  = cell(col_name)
-            qty_val   = cell(col_qty)
-            price_val = cell(col_price)
-            unit_val  = cell(col_unit)
-            supp_val  = cell(col_supp)
-            notes_val = cell(col_notes)
-
-            # Рядок-розділ: немає кількості та/або назва порожня
-            # if not qty_val and not name_val:
-            #     # Це розділ з type_val як заголовком
-            #     if type_val:
-            #         current_section = type_val
-            #         skip_section = any(
-            #             s.lower() in type_val.lower() for s in SKIP_SECTIONS
-            #         )
-            #         marker = "⛔" if skip_section else "📂"
-            #         print(f"\n   {marker} Розділ: {type_val}")
-            #     continue
-
-            # Рядок-підрозділ (є type_val але немає qty)
-            # if type_val and not qty_val:
-            #     sub_text = type_val
-            #     skip_section = any(s.lower() in sub_text.lower() for s in SKIP_SECTIONS)
-            #     continue
-
-            # Порожній рядок
-            if not name_val and not type_val:
-                continue
-
-            # Пропускаємо розділи інженерів
-            # if skip_section:
-            #     continue
-
-            # Пропускаємо SKIP_ITEMS
-            full_name = f"{type_val} {name_val}".strip()
-            if any(si.lower() in full_name.lower() for si in SKIP_ITEMS):
-                print(f"   ⛔ Ігнорується: {full_name[:60]}")
-                continue
-            # ПРИМІТКА: раніше тут рядки з уже заповненою ціною повністю
-            # пропускалися (не потрапляли у список на обробку). Тепер
-            # ОБРОБЛЯЄМО всі рядки — перевірка "чи була ціна вже заповнена"
-            # переїхала у головний цикл run(): там ціну перезаписуємо, ЛИШЕ
-            # якщо знайшовся збіг у прайсі ETI або CHINT; якщо збігу немає —
-            # заповнену клітинку не чіпаємо (веб-пошук для неї не запускаємо).
-
-            # Кількість
-            try:
-                qty = float(qty_val.replace(",", ".").replace("\xa0", "")) if qty_val else 1.0
-            except ValueError:
-                qty = 1.0
-
-            items.append({
-                "row":           ridx + 1,        # 1-based рядок у таблиці
-                "section":       current_section,
-                "type":          type_val,
-                "name":          name_val,
-                "full_name":     full_name,
-                "qty":           1.0,
-                "unit":          unit_val,
-                "supplier":      supp_val,
-                "price_exist":   price_val,
-                "notes_exist":   notes_val,
-                # Індекси колонок (0-based)
-                "col_price":     col_price,
-                "col_supplier":  col_supp,
-                "col_notes":     col_notes,
-                "col_total":     col_total,
-            })
-
-        return items
-
-    # ── Записати ціну в таблицю ───────────────────────────
-    def write_result(self, item: Dict, price: float, supplier: str, note: str):
-        """Пише ціну, постачальника і примітку в таблицю."""
-        try:
-            row = item["row"]
-            updates = []
-
-            col_price = item.get("col_price")
-            col_supp  = item.get("col_supplier")
-            col_notes = item.get("col_notes")
-
-            if col_price is None:
-                print(f"   {Fore.RED}❌ Не знайдено колонку 'Ціна' — пропускаю запис{Style.RESET_ALL}")
-                return
-
-            # Ціна (UAH)
-            price_a1 = gspread.utils.rowcol_to_a1(row, col_price + 1)
-            updates.append({"range": price_a1, "values": [[price]]})
-
-            # Постачальник (якщо знайдено)
-            if col_supp is not None:
-                supp_a1 = gspread.utils.rowcol_to_a1(row, col_supp + 1)
-                updates.append({"range": supp_a1, "values": [[supplier]]})
-
-            # Примітка (якщо знайдено)
-            if col_notes is not None:
-                notes_a1 = gspread.utils.rowcol_to_a1(row, col_notes + 1)
-                updates.append({"range": notes_a1, "values": [[note[:500]]]})
-
-            # Batch update (один виклик API)
-            self.ws.batch_update(updates, value_input_option="USER_ENTERED")
-            print(f"   {Fore.GREEN}📝 Записано рядок {row}: {price:,.2f} грн → {price_a1}{Style.RESET_ALL}")
-
-        except gspread.exceptions.APIError as ex:
-            print(f"   {Fore.RED}❌ Google API помилка запису: {ex}{Style.RESET_ALL}")
-            print(f"      Якщо помилка 403 — видаліть token.json і запустіть заново")
-        except Exception as ex:
-            print(f"   {Fore.RED}❌ Помилка запису в таблицю: {ex}{Style.RESET_ALL}")
-
-        # Невелика пауза щоб не перевищити ліміт API
-        time.sleep(0.7)
-
-
-# ══════════════════════════════════════════════════════════
-# 5. ГОЛОВНА ЛОГІКА
-# ══════════════════════════════════════════════════════════
-
-def _print_header():
-    print(f"\n{Fore.CYAN}{'═'*62}")
-    print(f"{Fore.CYAN} EScore Energy — Автоматизатор цін для СЕС")
-    print(f"{Fore.CYAN}{'═'*62}{Style.RESET_ALL}\n")
-
-
-async def run(sheet_url: str):
-    _print_header()
-
-    # 1. Авторизація
-    creds = get_credentials()
-    gc    = gspread.Client(auth=creds)
-
-    # 2. ETI прайс
-    print(f"\n{Fore.CYAN}── Крок 1: Завантаження прайсу ETI ──────────────────{Style.RESET_ALL}")
-    eti = ETIPriceList(creds)
-    eti_ok = eti.load()
-    if not eti_ok:
-        print(f"   {Fore.YELLOW}ETI пропущено, перейдемо одразу до CHINT/інтернету{Style.RESET_ALL}")
-
-    # 2b. CHINT прайс (другий прайс — додано аналогічно ETI)
-    print(f"\n{Fore.CYAN}── Крок 1b: Завантаження прайсу CHINT ────────────────{Style.RESET_ALL}")
-    chint = CHINTPriceList(creds)
-    chint_ok = chint.load()
-    if not chint_ok:
-        print(f"   {Fore.YELLOW}CHINT пропущено, шукатимемо далі за звичною схемою{Style.RESET_ALL}")
-
-    # Перевірка ключа Serper (інтернет-пошук цін)
-    if get_serper_key():
-        print(f"   {Fore.GREEN}✅ Ключ Serper знайдено — інтернет-пошук активний{Style.RESET_ALL}")
-    else:
-        print(f"   {Fore.RED}❌ Ключ Serper не знайдено! Встав ключ у файл '{SERPER_KEY_FILE}' "
-              f"поруч зі скриптом. Інтернет-пошук цін не працюватиме.{Style.RESET_ALL}")
-
-    # 3. Відкрити таблицю
-    print(f"\n{Fore.CYAN}── Крок 2: Читання таблиці від інженерів ─────────────{Style.RESET_ALL}")
-    spec = SpecSheet(gc, sheet_url)
-    if not spec.open():
-        return
-
-    items = spec.get_items()
-    total = len(items)
-
-    if total == 0:
-        print(f"\n{Fore.YELLOW}⚠  Позицій для обробки не знайдено.")
-        print("   Перевірте назву вкладки та структуру таблиці.")
-        return
-
-    print(f"\n{Fore.CYAN}── Крок 3: Пошук цін ({total} позицій) ───────────────────{Style.RESET_ALL}")
-
-    stats = {"eti": 0, "chint": 0, "web": 0, "notfound": 0, "kept": 0}
-
-    for idx, item in enumerate(items, 1):
-        name      = item["name"]
-        full_name = item["full_name"]
-        has_price = bool(
-            item["price_exist"] and
-            item["price_exist"].strip() not in ("", "0", "$0", "$0.00", "грн.0.00")
-        )
-
-        print(f"\n[{idx}/{total}] {Fore.WHITE}{full_name[:70]}{Style.RESET_ALL}")
-        if item["unit"].lower() in ("уп", "упаковка"):
-            print(f"   ℹ️  Одиниця: упаковка = 100 шт")
-
-        prefix = ""
-        if has_price:
-            prefix = f"[Була ціна інженерів: {item['price_exist']}] "
-            print(f"   {Fore.YELLOW}ℹ️  Ціна вже є ({item['price_exist']}) — перевіряю{Style.RESET_ALL}")
-
-        # ── ETI ──────────────────────────────────────────
-        # Кабельну продукцію та аксесуари НЕ шукаємо в ETI — одразу в інтернет
-        # ── ETI: лише ТОЧНИЙ збіг назви/артикула ──────────
-        eti_result = eti.find(item["name"]) if eti_ok else None
-        if eti_result:
-            price, matched, note = eti_result
-            print(f"   {Fore.GREEN}✅ ETI (точний збіг): {price:,.2f} грн{Style.RESET_ALL}")
-            spec.write_result(item, price, "ETI/ДС-Електро", prefix + note)
-            stats["eti"] += 1
+    rows = []
+    for i, r in enumerate(values[1:], start=2):
+        def c(j):
+            return r[j] if j is not None and j < len(r) else None
+        name = str(c(cols["name"]) or "").strip()
+        if not name:
             continue
-
-        # ── CHINT: лише ТОЧНИЙ збіг назви/артикула ────────
-        chint_result = chint.find(item["name"]) if chint_ok else None
-        if chint_result:
-            price, matched, note = chint_result
-            print(f"   {Fore.GREEN}✅ CHINT (точний збіг): {price:,.2f} грн{Style.RESET_ALL}")
-            spec.write_result(item, price, "CHINT", prefix + note)
-            stats["chint"] += 1
-            continue
-
-        # ── Точного збігу немає → НІЧОГО не змінюємо ───────
-        # (ні фаззі, ні веб-пошук). Наявну ціну лишаємо як є.
-        print(f"   {Fore.CYAN}↔ Точного збігу в ETI/CHINT немає — лишаю без змін{Style.RESET_ALL}")
-        stats["kept"] += 1
-        continue
-
-    # ── Підсумок ───────────────────────────────────────────
-    print(f"\n{Fore.CYAN}{'═'*62}")
-    print(f"{Fore.GREEN} ГОТОВО!")
-    print(f"{Fore.WHITE}   З прайсу ETI:    {stats['eti']} поз.")
-    print(f"   З прайсу CHINT:  {stats['chint']} поз.")
-    print(f"   З інтернету:    {stats['web']} поз.")
-    print(f"   Залишено як є:  {stats['kept']} поз. (ціна вже була, збігу в ETI/CHINT не знайдено)")
-    print(f"   Не знайдено:   {stats['notfound']} поз. (уточнити вручну)")
-    print(f"{Fore.CYAN}{'═'*62}{Style.RESET_ALL}\n")
-
-    # ── Відмітка часу останнього оновлення ─────────────────
-    spec.write_timestamp()
+        rows.append(CatalogRow(i, str(c(cols["group"]) or ""), name, str(c(cols["supplier"]) or ""),
+                               to_float(c(cols["price"])), str(c(MAPPING_COL) or ""),
+                               str(c(SOURCE_COL) or ""), str(c(ARTICLE_COL) or "")))
+    return rows, cols
 
 
-# ══════════════════════════════════════════════════════════
-# ТОЧКА ВХОДУ
-# ══════════════════════════════════════════════════════════
+def last_update_age_days(stamp_text: str) -> Optional[float]:
+    m = re.search(r"(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2})", stamp_text or "")
+    if not m:
+        return None
+    then = datetime.strptime(m.group(1), "%d.%m.%Y %H:%M").replace(tzinfo=kyiv_now().tzinfo)
+    return (kyiv_now() - then).total_seconds() / 86400
 
-def resolve_sheet_url(sheet_url: str = "") -> str:
-    """URL таблиці: аргумент → env-змінна SHEET_URL → константа SHEET_URL у файлі."""
-    return (sheet_url or os.environ.get("SHEET_URL", "") or SHEET_URL or "").strip()
 
-
-def get_last_update(sheet_url: str = "") -> str:
-    """Повертає рядок відмітки останнього оновлення з таблиці ('' якщо немає/помилка)."""
-    url = resolve_sheet_url(sheet_url)
-    if not url or "docs.google.com/spreadsheets" not in url:
-        return ""
+def write_review(wb, review, today: str):
+    import gspread
     try:
-        creds = get_credentials()
-        gc = gspread.Client(auth=creds)
-        wb = gc.open_by_url(url)
-        ws = None
-        for sheet in wb.worksheets():
-            if SPEC_TAB_NAME.lower() in sheet.title.lower():
-                ws = sheet
-                break
-        if ws is None:
-            return ""
-        return (ws.acell(TIMESTAMP_CELL).value or "").strip()
-    except Exception:
-        return ""
+        ws = wb.worksheet(REVIEW_TAB_NAME)
+        ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = wb.add_worksheet(REVIEW_TAB_NAME, rows=max(100, len(review) + 10), cols=10)
+    data = [[f"Оновлення {today}: позиції, де ціну НЕ змінено або потрібна увага. "
+             f"Щоб прив'язати позицію — впишіть у колонку J довідника, напр. «Kablex: MBN232»."],
+            ["Рядок", "Група", "Найменування", "Поточна ціна", "Причина",
+             "Кандидат: постачальник", "Кандидат: артикул", "Кандидат: назва", "Кандидат: ціна", "Схожість %"]]
+    for r, cands in review:
+        base = [r.row.row, r.row.group, r.row.name, r.row.price if r.row.price is not None else "", r.problem]
+        if cands:
+            for k, (it, score) in enumerate(cands):
+                data.append((base if k == 0 else ["", "", "", "", ""]) +
+                            [SUPPLIERS[it.supplier]["label"], it.code, it.name,
+                             it.price if it.price is not None else "", round(score)])
+        else:
+            data.append(base + ["", "", "", "", ""])
+    if ws.row_count < len(data):
+        ws.add_rows(len(data) - ws.row_count)
+    ws.update(values=data, range_name="A1", value_input_option="USER_ENTERED")
 
+
+def highlight(wb, ws, rows: List[CatalogRow], review):
+    """Знімає всю стару заливку в рядках довідника (крім заголовка) і фарбує A:E заново:
+    червоний — не знайдено в прайсах, жовтий — знайдено, але ціну не застосовано."""
+    if not rows:
+        return
+    last = max(cr.row for cr in rows)
+
+    def rng(r0, r1, c1=HIGHLIGHT_COLS):   # r0, r1 — 1-based включно
+        return {"sheetId": ws.id, "startRowIndex": r0 - 1, "endRowIndex": r1,
+                "startColumnIndex": 0, "endColumnIndex": c1}
+
+    # усі старі кольори в рядках довідника (усі колонки) знімаємо — лишається лише нова підсвітка
+    reqs = [{"repeatCell": {"range": rng(2, max(last, ws.row_count), ws.col_count),
+                            "cell": {"userEnteredFormat": {}},
+                            "fields": "userEnteredFormat.backgroundColor"}}]
+    for r, _ in review:
+        color = COLOR_CHECK if r.item else COLOR_NOT_FOUND
+        reqs.append({"repeatCell": {"range": rng(r.row.row, r.row.row),
+                                    "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                                    "fields": "userEnteredFormat.backgroundColor"}})
+    for i in range(0, len(reqs), 400):
+        wb.batch_update({"requests": reqs[i:i + 400]})
+    n_red = sum(1 for r, _ in review if not r.item)
+    print(f"🎨 Підсвічено: червоним {n_red} (не знайдено), жовтим {len(review) - n_red} (перевірити)")
+
+
+# ══════════════════════════════════════════════════════════
+# ГОЛОВНИЙ ЗАПУСК
+# ══════════════════════════════════════════════════════════
 
 def run_update(sheet_url: str = "") -> None:
-    """
-    Єдина точка входу для оновлення цін.
-    Використовується з терміналу, Streamlit-застосунку і GitHub Actions.
-    Кидає ValueError при невірному URL; інакше запускає асинхронний run().
-    """
-    url = resolve_sheet_url(sheet_url)
-    if not url:
-        raise ValueError("SHEET_URL порожній: задай посилання на таблицю "
-                         "(env-змінна SHEET_URL або константа у файлі).")
-    if "docs.google.com/spreadsheets" not in url:
-        raise ValueError("SHEET_URL не схожий на посилання Google Sheets "
-                         "(очікується https://docs.google.com/spreadsheets/...).")
-    asyncio.run(run(url))
+    import gspread
+    url = (sheet_url or os.environ.get("SHEET_URL", "") or SHEET_URL).strip()
+    dry = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
+    print("═" * 62 + "\n  EScore Energy — оновлення цін з прайсів\n" + "═" * 62)
+
+    creds = get_credentials()
+    wb, ws = open_sheet(creds, url)
+    values = ws.get_all_values()
+
+    if os.environ.get("SCHEDULED", "").strip() in ("1", "true", "yes"):
+        stamp = ws.acell(TIMESTAMP_CELL).value or ""
+        age = last_update_age_days(stamp)
+        if age is not None and age < MIN_DAYS_BETWEEN:
+            print(f"⏭ Останнє оновлення {age:.1f} дн. тому (< {MIN_DAYS_BETWEEN}) — пропускаю запуск за розкладом")
+            return
+
+    books = load_books_from_drive(creds)
+    if not books:
+        sys.exit("❌ Жодного прайсу не прочитано — таблицю не змінено")
+
+    rows, cols = read_catalog(values)
+    results, review = plan(rows, books)
+    today = kyiv_now().strftime("%d.%m.%Y")
+
+    updates = []
+    changed = same = 0
+    a1 = gspread.utils.rowcol_to_a1
+    for r in results:
+        if r.new_price is None:
+            continue
+        cr = r.row
+        label = SUPPLIERS[r.item.supplier]["label"]
+        note = source_note(r, today)
+        if cr.price is None or abs(cr.price - r.new_price) > 0.005:
+            changed += 1
+            print(f"  ✏ р.{cr.row}: {cr.name[:55]} — {cr.price} → {r.new_price}")
+        else:
+            same += 1
+        updates.append({"range": a1(cr.row, cols["price"] + 1), "values": [[r.new_price]]})
+        updates.append({"range": a1(cr.row, cols["supplier"] + 1), "values": [[label]]})
+        updates.append({"range": a1(cr.row, SOURCE_COL + 1), "values": [[note]]})
+        updates.append({"range": a1(cr.row, ARTICLE_COL + 1), "values": [[r.item.code_raw]]})
+
+    print(f"\nЗнайдено в прайсах: {changed + same} (змінено ціну: {changed}, без змін: {same})")
+    print(f"На перевірку: {len(review)} (стара ціна лишається)")
+
+    if dry:
+        print("\nDRY_RUN — у таблицю нічого не записано.")
+        return
+
+    updates.append({"range": a1(1, SOURCE_COL + 1), "values": [[SOURCE_HEADER]]})
+    updates.append({"range": a1(1, ARTICLE_COL + 1), "values": [[ARTICLE_HEADER]]})
+    stamp = kyiv_now().strftime("%d.%m.%Y %H:%M")
+    updates.append({"range": TIMESTAMP_CELL, "values": [[TIMESTAMP_PREFIX + stamp]]})
+    for i in range(0, len(updates), 500):
+        ws.batch_update(updates[i:i + 500], value_input_option="USER_ENTERED")
+    write_review(wb, review, today)
+    highlight(wb, ws, rows, review)
+    print(f"✅ Готово. Відмітка оновлення: {stamp}")
 
 
 def main():
-    try:
-        run_update()
-    except ValueError as e:
-        print(f"\n{Fore.RED}❌ {e}{Style.RESET_ALL}\n")
-        sys.exit(1)
+    run_update()
 
 
 if __name__ == "__main__":

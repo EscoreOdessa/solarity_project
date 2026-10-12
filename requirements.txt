@@ -1,14 +1,14 @@
-# Залежності застосунку оновлення цін (price_finder.py + streamlit_app.py)
+# Залежності оновлення цін (price_finder.py; streamlit_app.py — на паузі)
 streamlit
-gspread==6.2.1
-google-auth==2.55.0
-google-auth-oauthlib==1.4.0
+gspread>=6.2.1
+google-auth>=2.55.0
+google-auth-oauthlib>=1.4.0
 google-api-python-client
 openpyxl
+xlrd>=2.0.1
 rapidfuzz
 colorama
 tzdata
 
 # Примітка: WeasyPrint/reportlab (генерація PDF-КП) свідомо НЕ включені —
 # вони потрібні лише для друку КП локально й ускладнюють збірку в хмарі.
-# Для онлайн-оновлення цін вони не потрібні.
