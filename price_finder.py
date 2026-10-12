@@ -940,6 +940,11 @@ def run_update(sheet_url: str = "") -> None:
         art_updates.append({"range": a1(cr.row, ARTICLE_COL + 1), "values": [[str(r.item.code_raw)]]})
 
     print(f"\nЗнайдено в прайсах: {changed + same} (змінено ціну: {changed}, без змін: {same})")
+    if not dry:
+        # етап 4: ціна, що лишиться в таблиці після запису, проти ціни, яку рахує база
+        final = {cr.row: cr.price for cr in rows}
+        final.update({r.row.row: r.new_price for r in results if r.new_price is not None})
+        db_sync.reconcile(final)
     print(f"На перевірку: {len(review)} (стара ціна лишається)")
 
     if dry:

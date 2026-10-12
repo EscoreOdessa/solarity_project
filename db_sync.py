@@ -218,3 +218,46 @@ def save_reference(values, results, review, url: Optional[str] = None) -> bool:
     except Exception as ex:
         print(f"⚠ Запис довідника в базу не вдався: {ex}")
         return False
+
+
+# ══════════════════════════════════════════════════════════
+# ЕТАП 4: звірка цін «база ↔ таблиця»
+# ══════════════════════════════════════════════════════════
+
+def reconcile(expected: Dict[int, Optional[float]], url: Optional[str] = None, show: int = 20) -> Optional[int]:
+    """expected — {рядок довідника: ціна, яку скрипт залишив у таблиці}.
+    Порівнює з escore.v_reference_prices (ціна, яку база рахує сама за прайсами й pricing_rules).
+    Повертає кількість розбіжностей або None, якщо база недоступна."""
+    url = url or os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        return None
+    try:
+        import psycopg
+        with psycopg.connect(url, connect_timeout=20) as conn, conn.cursor() as cur:
+            cur.execute("select sheet_row, price, price_source, name, coalesce(source_note, '') "
+                        "from escore.v_reference_prices")
+            db = {r[0]: r for r in cur.fetchall()}
+    except Exception as ex:
+        print(f"⚠ Звірка з базою не вдалася: {ex}")
+        return None
+
+    diffs = []
+    for row, sheet_price in expected.items():
+        rec = db.get(row)
+        db_price = float(rec[1]) if rec and rec[1] is not None else None
+        if sheet_price is None and db_price is None:
+            continue
+        if sheet_price is None or db_price is None or abs(sheet_price - db_price) > 0.01:
+            diffs.append((row, sheet_price, db_price, rec[2] if rec else "немає в базі",
+                          (rec[3] if rec else "")[:50], rec[4] if rec else ""))
+    missing = [r for r in db if r not in expected]
+
+    if not diffs and not missing:
+        print(f"🟰 Звірка база ↔ таблиця: {len(expected)} позицій, розбіжностей немає")
+        return 0
+    print(f"⚠ Звірка база ↔ таблиця: розбіжностей {len(diffs)}, зайвих рядків у базі {len(missing)}")
+    for row, s, d, src, name, note in diffs[:show]:
+        print(f"   р.{row}: таблиця {s} | база {d} ({src}) — {name} {('· ' + note) if note else ''}")
+    if len(diffs) > show:
+        print(f"   … і ще {len(diffs) - show}")
+    return len(diffs) + len(missing)
