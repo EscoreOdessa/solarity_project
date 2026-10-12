@@ -209,6 +209,7 @@ class PriceItem:
 class PriceBook:
     supplier: str
     file_name: str
+    file_id: str = ""
     by_code: Dict[str, PriceItem] = field(default_factory=dict)
     by_name: Dict[str, PriceItem] = field(default_factory=dict)
 
@@ -715,6 +716,7 @@ def load_books_from_drive(creds) -> Dict[str, PriceBook]:
                 _, done = dl.next_chunk()
             book = PARSERS[key](buf.getvalue(), fname)
             book.file_name = f["name"]
+            book.file_id = f["id"]
             books[key] = book
             print(f"📋 {SUPPLIERS[key]['label']}: {f['name']} — {len(book)} позицій")
         except Exception as ex:
@@ -905,6 +907,9 @@ def run_update(sheet_url: str = "") -> None:
     books = load_books_from_drive(creds)
     if not books:
         sys.exit("❌ Жодного прайсу не прочитано — таблицю не змінено")
+    if not dry:
+        import db_sync
+        db_sync.save_books(books)   # PostgreSQL паралельно з таблицею; помилка бази не зупиняє оновлення
 
     rows, cols = read_catalog(values)
     results, review = plan(rows, books)
