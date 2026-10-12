@@ -35,6 +35,7 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_URL: ${{ secrets.SHEET_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SCHEDULED: ${{ github.event_name == 'schedule' && '1' || '' }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
         run: python price_finder.py
