@@ -150,7 +150,12 @@ def to_float(v) -> Optional[float]:
     if isinstance(v, (int, float)):
         return float(v)
     s = str(v).replace("\xa0", "").replace(" ", "").replace("₴", "")
-    s = s.replace("грн.", "").replace("грн", "").replace("$", "").replace(",", ".")
+    s = s.replace("грн.", "").replace("грн", "").replace("$", "").replace("€", "")
+    if "," in s and "." in s:
+        # «2,146.00» (кома — розділювач тисяч) або «2.146,00» (крапка — тисячі)
+        s = s.replace(",", "") if s.rfind(".") > s.rfind(",") else s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
     try:
         return float(s)
     except ValueError:
@@ -830,7 +835,7 @@ def run_update(sheet_url: str = "") -> None:
 
     creds = get_credentials()
     wb, ws = open_sheet(creds, url)
-    values = ws.get_all_values()
+    values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")   # ціни — числами
 
     if os.environ.get("SCHEDULED", "").strip() in ("1", "true", "yes"):
         stamp = ws.acell(TIMESTAMP_CELL).value or ""
