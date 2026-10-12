@@ -135,8 +135,12 @@ def raw_code(v) -> str:
     if isinstance(v, float) and v.is_integer():
         v = int(v)
     s = str(v).strip().strip("()[]").strip()
-    if re.fullmatch(r"\d+\.0", s):
-        s = s[:-2]
+    # число, яке Google Sheets показав у форматі «131,361.00» / «131 361,00» → 131361
+    m = re.fullmatch(r"(\d{1,3}(?:[,\s\xa0]\d{3})+)(?:[.,]0+)?", s)
+    if m:
+        s = re.sub(r"[,\s\xa0]", "", m.group(1))
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
     return s
 
 
@@ -551,19 +555,16 @@ def match_row(cr: CatalogRow, books: Dict[str, PriceBook]) -> Result:
             res.problem = f"Артикул {code or '—'} відсутній у прайсі {book.file_name}"
             return res
         res.item, res.how = it, f"арт. {it.code}"
-    elif cr.article.strip():
+    if not res.item and not (sup or code) and str(cr.article).strip():
         # артикул у колонці E; постачальник — з колонки C (або шукаємо в усіх прайсах)
-        code = norm_code(raw_code(cr.article))
+        ecode = norm_code(raw_code(cr.article))
         sup_col = detect_supplier(cr.supplier)
         for s in ([sup_col] if sup_col else list(books)):
             book = books.get(s)
-            if book and code in book.by_code:
-                res.item, res.how = book.by_code[code], f"арт. {code} (колонка E)"
+            if book and ecode in book.by_code:
+                res.item, res.how = book.by_code[ecode], f"арт. {ecode} (колонка E)"
                 break
-        if not res.item:
-            res.problem = f"Артикул {cr.article} (колонка E) не знайдено в прайсах"
-            return res
-    else:
+    if not res.item and not (sup or code):
         # без прив'язки: ETI/CHINT — артикул у назві або точний збіг назви
         sup_col = detect_supplier(cr.supplier)
         order = [sup_col] if sup_col in ("eti", "chint") else ([] if sup_col else ["eti", "chint"])
