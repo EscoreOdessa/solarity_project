@@ -128,3 +128,93 @@ def save_books(books: Dict[str, object], url: Optional[str] = None) -> bool:
     except Exception as ex:
         print(f"⚠ Запис у базу не вдався (таблицю оновлюємо як завжди): {ex}")
         return False
+
+
+# ══════════════════════════════════════════════════════════
+# ЕТАП 3: довідник і прив'язки (дзеркало вкладки «Довідник», повне оновлення)
+# ══════════════════════════════════════════════════════════
+
+def _method(how: str) -> str:
+    h = (how or "").lower()
+    if "колонка e" in h:
+        return "article_e"
+    if "з назви" in h:
+        return "article_in_name"
+    if "збіг назви" in h:
+        return "exact_name"
+    return "manual_j"
+
+
+def save_reference(values, results, review, url: Optional[str] = None) -> bool:
+    """values — уся вкладка «Довідник» (як із get_all_values); results/review — з price_finder.plan().
+
+    Поки «Довідник» — головне джерело, база щоразу перезаписує довідник і прив'язки з нього.
+    Підтверджена прив'язка = ціну з прайсу застосовано; кандидат = різка зміна ціни або підказка зі схожістю.
+    """
+    url = url or os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        return False
+    try:
+        import psycopg
+    except ImportError:
+        return False
+
+    def cell(row, j):
+        return str(row[j]).strip() if j < len(row) and row[j] is not None else ""
+
+    refs, maps = [], []
+    for r in results:
+        cr = r.row
+        raw = values[cr.row - 1] if cr.row - 1 < len(values) else []
+        sub, sub2 = cell(raw, 5) or None, cell(raw, 6) or None
+        confirmed = r.item is not None and r.new_price is not None
+        manual = None if confirmed else cr.price
+        refs.append((cr.row, cr.group or "—", sub, sub2, cr.name, manual))
+        note_1c = "1С" if cr.source.startswith("Зіставлено з 1С") else None
+        if r.item is not None:
+            maps.append((cr.row, r.item.supplier, r.item.code or None, r.item.name, _method(r.how),
+                         "confirmed" if confirmed else "candidate", confirmed, None,
+                         note_1c if confirmed else r.problem))
+    for r, cands in review:
+        for it, score in cands:
+            maps.append((r.row.row, it.supplier, it.code or None, it.name, "fuzzy",
+                         "candidate", False, score, None))
+
+    try:
+        with psycopg.connect(url, connect_timeout=20) as conn, conn.cursor() as cur:
+            cur.execute("delete from escore.item_mappings")
+            cur.execute("delete from escore.reference_items")
+            cur.executemany(
+                """insert into escore.reference_items
+                     (sheet_row, grp, subgroup, subgroup2, name, manual_price)
+                   values (%s, %s, %s, %s, %s, %s)""", refs)
+            cur.execute("""create temp table _maps (
+                             sheet_row int, sup text, article_norm text, name text, method text,
+                             status text, is_primary boolean, similarity numeric, note text
+                           ) on commit drop""")
+            with cur.copy("copy _maps from stdin") as cp:
+                for m in maps:
+                    cp.write_row(m)
+            cur.execute(
+                """insert into escore.item_mappings
+                     (reference_item_id, supplier_item_id, method, status, is_primary, similarity,
+                      confirmed_at, note)
+                   select distinct on (ri.id, si.id)
+                          ri.id, si.id, m.method, m.status, m.is_primary, m.similarity,
+                          case when m.status = 'confirmed' then now() end, m.note
+                   from _maps m
+                   join escore.reference_items ri on ri.sheet_row = m.sheet_row
+                   join escore.suppliers s on s.code = m.sup
+                   join escore.supplier_items si on si.supplier_id = s.id
+                    and (si.article_norm = m.article_norm
+                         or (m.article_norm is null and si.article_norm is null and si.name = m.name))
+                   order by ri.id, si.id, m.is_primary desc""")
+            linked = cur.rowcount
+            conn.commit()
+        n_conf = sum(1 for m in maps if m[6])
+        print(f"🗄 База: довідник — {len(refs)} позицій, прив'язок {linked} "
+              f"(підтверджених {n_conf}, решта — кандидати)")
+        return True
+    except Exception as ex:
+        print(f"⚠ Запис довідника в базу не вдався: {ex}")
+        return False
