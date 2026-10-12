@@ -1,8 +1,8 @@
 # Залежності оновлення цін (price_finder.py; streamlit_app.py — на паузі)
 streamlit
-gspread>=6.2.1
-google-auth>=2.55.0
-google-auth-oauthlib>=1.4.0
+gspread==6.2.1
+google-auth==2.55.0
+google-auth-oauthlib==1.4.0
 google-api-python-client
 openpyxl
 xlrd>=2.0.1
