@@ -343,8 +343,8 @@ def parse_bdk(data: bytes, file_name: str) -> PriceBook:
         return r[j] if j is not None and j < len(r) else None
 
     for r in rows[hdr + 1:]:
-        raw = raw_code(g(r, "code"))
-        code = norm_code(raw)
+        art = raw_code(g(r, "code"))
+        code = norm_code(art)
         name = g(r, "name")
         if not code or not name:
             continue
@@ -355,7 +355,7 @@ def parse_bdk(data: bytes, file_name: str) -> PriceBook:
             status = (status + " / " if status else "") + str(raw).strip()   # «за запитом»
         price = round(base * (1 - BDK_DISCOUNT) * BDK_VAT, 2) if base and base > 0 else None
         book.add(PriceItem("bdk", code, str(name).strip(), price, base, BDK_DISCOUNT, status,
-                           code_raw=raw))
+                           code_raw=art))
     return book
 
 
