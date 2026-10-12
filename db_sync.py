@@ -78,6 +78,14 @@ def save_books(books: Dict[str, object], url: Optional[str] = None) -> bool:
                 if key not in sup_ids:
                     print(f"⚠ База: постачальника «{key}» немає в escore.suppliers — пропущено")
                     continue
+                # Файл з такою назвою (а в назві — дата прайсу) вже завантажено → не дублюємо історію
+                cur.execute("""select id from escore.import_runs
+                               where supplier_id = %s and file_name = %s and status = 'ok'
+                               order by id limit 1""", (sup_ids[key], book.file_name))
+                prev = cur.fetchone()
+                if prev:
+                    print(f"⏭ База: {book.file_name} вже завантажено (запуск #{prev[0]}) — пропущено")
+                    continue
                 items = list(_items(book))
                 rates = {it.currency: it.rate for it in items if it.currency != "UAH" and it.rate}
                 cur.execute(
