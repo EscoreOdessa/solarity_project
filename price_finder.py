@@ -541,6 +541,8 @@ def parse_mapping(text: str) -> Tuple[Optional[str], Optional[str]]:
 
 def match_row(cr: CatalogRow, books: Dict[str, PriceBook]) -> Result:
     res = Result(cr)
+    if cr.mapping.strip() == "-":
+        return res          # «-» у колонці J: свідомо без прив'язки, ціна вручну, не на перевірку
     sup, code = parse_mapping(cr.mapping)
 
     if sup or code:
