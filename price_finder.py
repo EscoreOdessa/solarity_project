@@ -797,6 +797,16 @@ def write_review(wb, review, today: str):
     ws.update(values=data, range_name="A1", value_input_option="USER_ENTERED")
 
 
+def set_article_text_format(wb, ws, last_row: int):
+    """Колонка E (артикул) — текстовий формат, щоб артикули не перетворювались на числа."""
+    rng = {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": max(last_row, ws.row_count),
+           "startColumnIndex": ARTICLE_COL, "endColumnIndex": ARTICLE_COL + 1}
+    wb.batch_update({"requests": [{"repeatCell": {
+        "range": rng,
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}, "horizontalAlignment": "LEFT"}},
+        "fields": "userEnteredFormat.numberFormat,userEnteredFormat.horizontalAlignment"}}]})
+
+
 def highlight(wb, ws, rows: List[CatalogRow], review):
     """Знімає всю стару заливку в рядках довідника (крім заголовка) і фарбує A:E заново:
     червоний — не знайдено в прайсах, жовтий — знайдено, але ціну не застосовано."""
@@ -853,6 +863,7 @@ def run_update(sheet_url: str = "") -> None:
     today = kyiv_now().strftime("%d.%m.%Y")
 
     updates = []
+    art_updates = []          # артикули пишемо як ТЕКСТ (RAW), інакше 131361 стає числом «131,361.00»
     changed = same = 0
     a1 = gspread.utils.rowcol_to_a1
     for r in results:
@@ -869,7 +880,7 @@ def run_update(sheet_url: str = "") -> None:
         updates.append({"range": a1(cr.row, cols["price"] + 1), "values": [[r.new_price]]})
         updates.append({"range": a1(cr.row, cols["supplier"] + 1), "values": [[label]]})
         updates.append({"range": a1(cr.row, SOURCE_COL + 1), "values": [[note]]})
-        updates.append({"range": a1(cr.row, ARTICLE_COL + 1), "values": [[r.item.code_raw]]})
+        art_updates.append({"range": a1(cr.row, ARTICLE_COL + 1), "values": [[str(r.item.code_raw)]]})
 
     print(f"\nЗнайдено в прайсах: {changed + same} (змінено ціну: {changed}, без змін: {same})")
     print(f"На перевірку: {len(review)} (стара ціна лишається)")
@@ -882,8 +893,11 @@ def run_update(sheet_url: str = "") -> None:
     updates.append({"range": a1(1, ARTICLE_COL + 1), "values": [[ARTICLE_HEADER]]})
     stamp = kyiv_now().strftime("%d.%m.%Y %H:%M")
     updates.append({"range": TIMESTAMP_CELL, "values": [[TIMESTAMP_PREFIX + stamp]]})
+    set_article_text_format(wb, ws, max((cr.row for cr in rows), default=2))
     for i in range(0, len(updates), 500):
         ws.batch_update(updates[i:i + 500], value_input_option="USER_ENTERED")
+    for i in range(0, len(art_updates), 500):
+        ws.batch_update(art_updates[i:i + 500], value_input_option="RAW")
     write_review(wb, review, today)
     highlight(wb, ws, rows, review)
     print(f"✅ Готово. Відмітка оновлення: {stamp}")
