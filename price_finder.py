@@ -773,6 +773,51 @@ def last_update_age_days(stamp_text: str) -> Optional[float]:
     return (kyiv_now() - then).total_seconds() / 86400
 
 
+RENAMES_FILE = "renames_1c.csv"   # разове перейменування позицій за зіставленням з 1С
+
+
+def apply_renames(ws, values, dry: bool) -> bool:
+    """Застосовує renames_1c.csv (old → new, артикул, постачальник).
+    Рядок змінюється лише якщо в колонці B стоїть РІВНО старе найменування,
+    тож повторний запуск нічого не зіпсує. Повертає True, якщо щось змінено."""
+    import csv
+    import gspread
+    p = Path(__file__).with_name(RENAMES_FILE)
+    if not p.exists():
+        return False
+    by_old = {}
+    for r in csv.DictReader(p.open(encoding="utf-8")):
+        by_old.setdefault(" ".join(r["old"].split()), r)
+    a1 = gspread.utils.rowcol_to_a1
+    upd, upd_raw = [], []
+    stamp = f"Зіставлено з 1С {kyiv_now().strftime('%d.%m.%Y')}"
+    for i, row in enumerate(values[1:], start=2):
+        name = " ".join(str(row[1] if len(row) > 1 else "").split())
+        r = by_old.get(name)
+        if not r:
+            continue
+        upd.append({"range": a1(i, 2), "values": [[r["new"]]]})
+        if r["supplier"]:
+            upd.append({"range": a1(i, 3), "values": [[r["supplier"]]]})
+        if r["article"]:
+            upd_raw.append({"range": a1(i, ARTICLE_COL + 1), "values": [[r["article"]]]})
+        if r.get("clear_j"):   # підтверджений артикул важливіший за стару прив'язку в J
+            upd.append({"range": a1(i, MAPPING_COL + 1), "values": [[""]]})
+        k = str(row[SOURCE_COL]) if len(row) > SOURCE_COL else ""
+        if r.get("stamp") and not k.strip():   # підтверджено → без захисту від «різкої зміни»
+            upd.append({"range": a1(i, SOURCE_COL + 1), "values": [[stamp]]})
+        print(f"  ↻ р.{i}: «{name[:50]}» → «{r['new'][:50]}» | арт. {r['article'] or '—'}")
+    if not upd:
+        return False
+    print(f"Перейменовано за 1С: {sum(1 for u in upd if u['range'].startswith('B'))} позицій")
+    if dry:
+        return False
+    ws.batch_update(upd, value_input_option="USER_ENTERED")
+    if upd_raw:
+        ws.batch_update(upd_raw, value_input_option="RAW")
+    return True
+
+
 def write_review(wb, review, today: str):
     import gspread
     try:
@@ -847,6 +892,8 @@ def run_update(sheet_url: str = "") -> None:
     creds = get_credentials()
     wb, ws = open_sheet(creds, url)
     values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")   # ціни — числами
+    if apply_renames(ws, values, dry):
+        values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
 
     if os.environ.get("SCHEDULED", "").strip() in ("1", "true", "yes"):
         stamp = ws.acell(TIMESTAMP_CELL).value or ""
