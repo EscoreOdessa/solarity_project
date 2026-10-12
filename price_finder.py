@@ -913,6 +913,8 @@ def run_update(sheet_url: str = "") -> None:
 
     rows, cols = read_catalog(values)
     results, review = plan(rows, books)
+    if not dry:
+        db_sync.save_reference(values, results, review)   # етап 3: довідник і прив'язки → база
     today = kyiv_now().strftime("%d.%m.%Y")
 
     updates = []
