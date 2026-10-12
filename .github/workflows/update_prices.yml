@@ -1,8 +1,18 @@
 name: Оновлення цін СЕС
 
 # Коли запускати:
+#  • за розкладом — щопонеділка; скрипт сам пропускає запуск, якщо з останнього
+#    оновлення (клітинка J1) минуло менше 13 днів → фактично раз на два тижні;
+#  • вручну — кнопка «Run workflow» тут або меню «Оновити ціни» в таблиці.
 on:
-  workflow_dispatch: {}   # кнопка ручного запуску у вкладці Actions
+  schedule:
+    - cron: "0 4 * * 1"      # понеділок 04:00 UTC ≈ 07:00 за Києвом
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Пробний запуск: нічого не записувати в таблицю"
+        type: boolean
+        default: false
 
 jobs:
   update-prices:
@@ -23,7 +33,8 @@ jobs:
 
       - name: Оновити ціни
         env:
-          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_URL: ${{ secrets.SHEET_URL }}
+          SCHEDULED: ${{ github.event_name == 'schedule' && '1' || '' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
         run: python price_finder.py
