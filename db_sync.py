@@ -269,3 +269,24 @@ def reconcile(expected: Dict[int, Optional[float]], url: Optional[str] = None, s
     if len(diffs) > show:
         print(f"   … і ще {len(diffs) - show}")
     return len(diffs) + len(missing)
+
+
+# ══════════════════════════════════════════════════════════
+# ЕТАП 5: ціни для довідника — з бази
+# ══════════════════════════════════════════════════════════
+
+def load_reference_prices(url: Optional[str] = None):
+    """{рядок довідника: (ціна, джерело, примітка для колонки K)} з escore.v_reference_prices.
+    None — якщо база недоступна (тоді ціни рахує код, як раніше)."""
+    url = url or os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        return None
+    try:
+        import psycopg
+        with psycopg.connect(url, connect_timeout=20) as conn, conn.cursor() as cur:
+            cur.execute("select sheet_row, price, price_source, coalesce(source_note, '') "
+                        "from escore.v_reference_prices")
+            return {r[0]: (float(r[1]) if r[1] is not None else None, r[2], r[3]) for r in cur.fetchall()}
+    except Exception as ex:
+        print(f"⚠ Не вдалося прочитати ціни з бази: {ex}")
+        return None

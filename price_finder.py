@@ -919,6 +919,15 @@ def run_update(sheet_url: str = "") -> None:
         db_sync.save_reference(values, results, review)   # етап 3: довідник і прив'язки → база
     today = kyiv_now().strftime("%d.%m.%Y")
 
+    # етап 5: ціну для довідника рахує база (прайс + escore.pricing_rules).
+    # PRICE_SOURCE=code (змінна репозиторію) — повернутися до розрахунку в коді.
+    db_prices = None
+    if not dry and os.environ.get("PRICE_SOURCE", "").strip().lower() != "code":
+        db_prices = db_sync.load_reference_prices()
+        print("🗄 Ціни для довідника — з бази" if db_prices is not None
+              else "⚠ База недоступна — ціни рахує код, як раніше")
+    code_vs_db = []
+
     updates = []
     art_updates = []          # артикули пишемо як ТЕКСТ (RAW), інакше 131361 стає числом «131,361.00»
     changed = same = 0
@@ -929,6 +938,11 @@ def run_update(sheet_url: str = "") -> None:
         cr = r.row
         label = SUPPLIERS[r.item.supplier]["label"]
         note = source_note(r, today)
+        rec = db_prices.get(cr.row) if db_prices is not None else None
+        if rec and rec[1] == "price_list" and rec[0] is not None:
+            if abs(rec[0] - r.new_price) > 0.005:
+                code_vs_db.append((cr.row, cr.name, r.new_price, rec[0]))
+            r.new_price, note = rec[0], rec[2]
         if cr.price is None or abs(cr.price - r.new_price) > 0.005:
             changed += 1
             print(f"  ✏ р.{cr.row}: {cr.name[:55]} — {cr.price} → {r.new_price}")
@@ -940,6 +954,11 @@ def run_update(sheet_url: str = "") -> None:
         art_updates.append({"range": a1(cr.row, ARTICLE_COL + 1), "values": [[str(r.item.code_raw)]]})
 
     print(f"\nЗнайдено в прайсах: {changed + same} (змінено ціну: {changed}, без змін: {same})")
+    if code_vs_db:
+        print(f"ℹ Код і база рахують ціну по-різному: {len(code_vs_db)} позицій (у таблицю — ціна з бази). "
+              f"Перевірте знижки в escore.pricing_rules:")
+        for row, name, c, d in code_vs_db[:10]:
+            print(f"   р.{row}: код {c} | база {d} — {name[:55]}")
     if not dry:
         # етап 4: ціна, що лишиться в таблиці після запису, проти ціни, яку рахує база
         final = {cr.row: cr.price for cr in rows}
