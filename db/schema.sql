@@ -20,7 +20,7 @@ create table import_runs (
   drive_file_id text,
   file_name     text not null,
   price_date    date,                         -- дата прайсу (з назви / «Дійсний з»)
-  rates         jsonb not null default '{}',  -- курси на день завантаження: {"EUR": 50.5, "USD": 45.1}
+  rates         jsonb not null default '{}',  -- курси НБУ останнього запуску (оновлюються щоразу): {"EUR": 50.5}
   rates_source  text,                         -- НБУ / резервні значення
   rows_parsed   int,
   status        text not null default 'ok' check (status in ('ok','failed')),
