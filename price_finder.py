@@ -940,7 +940,7 @@ def run_update(sheet_url: str = "") -> None:
         note = source_note(r, today)
         rec = db_prices.get(cr.row) if db_prices is not None else None
         if rec and rec[1] == "price_list" and rec[0] is not None:
-            if abs(rec[0] - r.new_price) > 0.005:
+            if abs(rec[0] - r.new_price) > 0.011:     # 1 коп. — різниця округлення, не показуємо
                 code_vs_db.append((cr.row, cr.name, r.new_price, rec[0]))
             r.new_price, note = rec[0], rec[2]
         if cr.price is None or abs(cr.price - r.new_price) > 0.005:
