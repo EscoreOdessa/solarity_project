@@ -84,7 +84,13 @@ def save_books(books: Dict[str, object], url: Optional[str] = None) -> bool:
                                order by id limit 1""", (sup_ids[key], book.file_name))
                 prev = cur.fetchone()
                 if prev:
-                    print(f"⏭ База: {book.file_name} вже завантажено (запуск #{prev[0]}) — пропущено")
+                    # прайс той самий, але курс EUR/USD — сьогоднішній (як і раніше рахував код)
+                    rates_now = {it.currency: it.rate for it in _items(book) if it.currency != "UAH" and it.rate}
+                    if rates_now:
+                        cur.execute("update escore.import_runs set rates = %s, rates_source = %s where id = %s",
+                                    (psycopg.types.json.Jsonb(rates_now), "НБУ, оновлено", prev[0]))
+                    print(f"⏭ База: {book.file_name} вже завантажено (запуск #{prev[0]}) — пропущено"
+                          + (f", курс оновлено: {rates_now}" if rates_now else ""))
                     continue
                 items = list(_items(book))
                 rates = {it.currency: it.rate for it in items if it.currency != "UAH" and it.rate}
