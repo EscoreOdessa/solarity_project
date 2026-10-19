@@ -5,13 +5,15 @@ insert into suppliers (code, label, file_regex, note) values
   ('eti',    'ETI/ДС-Електро',  '^eti',              'Ціна в грн з ПДВ'),
   ('chint',  'CHINT',           'chint',             'Знижка вже врахована у файлі'),
   ('bdk',    'Прайс БДК (DKC)', '^(bdk|бдк|dkc)',    'Рекомендована ціна БЕЗ ПДВ'),
-  ('kablex', 'Kablex',          '^(kablex|каблекс)', 'Частина цін у EUR/USD, знижка за групою');
+  ('kablex', 'Kablex',          '^(kablex|каблекс)', 'Частина цін у EUR/USD, знижка за групою'),
+  ('kopos',  'KOPOS (Ресурс Електро)', '^(kopos|копос)', 'EUR/грн БЕЗ ПДВ за 1000 шт/м, курс з файлу');
 
 insert into pricing_rules (supplier_id, group_match, discount, vat_multiplier, priority, note)
 select s.id, r.grp, r.disc, r.vat, r.prio, r.note
 from (values
   ('eti',    null,              0.25, 1.0, 0, 'ETI_DISCOUNT'),
   ('chint',  null,              0.00, 1.0, 0, 'CHINT_DISCOUNT'),
+  ('kopos',  null,              0.00, 1.2, 0, 'KOPOS_DISCOUNT, KOPOS_VAT'),
   ('bdk',    null,              0.00, 1.2, 0, 'BDK_DISCOUNT, BDK_VAT'),
   ('kablex', null,              0.00, 1.0, 0, 'група без налаштованої знижки → на перевірку'),
   ('kablex', 'кабель',          0.37, 1.0, 10, null),
