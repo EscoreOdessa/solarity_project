@@ -755,8 +755,9 @@ def get_credentials():
     from google.oauth2 import service_account
     sa_env = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if sa_env:
-        print("✅ Авторизація: сервісний акаунт (секрет оточення)")
-        return service_account.Credentials.from_service_account_info(json.loads(sa_env), scopes=SCOPES)
+        info = json.loads(sa_env)
+        print(f"✅ Авторизація: сервісний акаунт {info.get('client_email', '')} (секрет оточення)")
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     p = Path("service_account.json")
     if p.exists():
         print("✅ Авторизація: service_account.json")
