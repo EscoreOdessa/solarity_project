@@ -13,7 +13,7 @@ select s.id, r.grp, r.disc, r.vat, r.prio, r.note
 from (values
   ('eti',    null,              0.25, 1.0, 0, 'ETI_DISCOUNT'),
   ('chint',  null,              0.00, 1.0, 0, 'CHINT_DISCOUNT'),
-  ('kopos',  null,              0.00, 1.2, 0, 'KOPOS_DISCOUNT, KOPOS_VAT'),
+  ('kopos',  null,              0.15, 1.2, 0, 'KOPOS: знижка 15%, ×1.2 ПДВ'),
   ('bdk',    null,              0.00, 1.2, 0, 'BDK_DISCOUNT, BDK_VAT'),
   ('kablex', null,              0.00, 1.0, 0, 'група без налаштованої знижки → на перевірку'),
   ('kablex', 'кабель',          0.37, 1.0, 10, null),

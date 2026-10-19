@@ -8,7 +8,7 @@ insert into suppliers (code, label, file_regex, note) values
 on conflict (code) do nothing;
 
 insert into pricing_rules (supplier_id, group_match, discount, vat_multiplier, priority, note)
-select s.id, null, 0.00, 1.2, 0, 'KOPOS_DISCOUNT, KOPOS_VAT'
+select s.id, null, 0.15, 1.2, 0, 'KOPOS: знижка 15%, ×1.2 ПДВ'
 from suppliers s
 where s.code = 'kopos'
   and not exists (select 1 from pricing_rules p where p.supplier_id = s.id);
