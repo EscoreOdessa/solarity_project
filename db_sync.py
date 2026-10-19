@@ -14,7 +14,7 @@ from datetime import date
 from typing import Dict, Optional
 
 # Ціна у прайсі вже з ПДВ? (для БДК — без ПДВ, множник ×1.2 у pricing_rules)
-VAT_INCLUDED = {"eti": True, "chint": True, "bdk": False, "kablex": True}
+VAT_INCLUDED = {"eti": True, "chint": True, "bdk": False, "kablex": True, "kopos": False}
 
 
 def price_date_from_name(file_name: str) -> Optional[date]:
@@ -111,7 +111,7 @@ def save_books(books: Dict[str, object], url: Optional[str] = None) -> bool:
                 with cur.copy("copy _stage from stdin") as cp:
                     for it in items:
                         # для Kablex status — наша примітка про знижку, а не статус прайсу
-                        status_raw = it.status if key == "bdk" else None
+                        status_raw = it.status if key in ("bdk", "kopos") else None
                         cp.write_row((it.code_raw or None, it.code or None, it.name, it.group or None,
                                       it.base, it.currency or "UAH", status_raw, map_status(status_raw)))
                 cur.execute(
