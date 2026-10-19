@@ -1,9 +1,9 @@
--- Новий постачальник KOPOS (Ресурс Електро). Разово, у Supabase → SQL Editor.
+-- Новий постачальник KOPOS (Ресурс-Електро). Разово, у Supabase → SQL Editor.
 -- Повторний запуск безпечний.
 set search_path = escore, public;
 
 insert into suppliers (code, label, file_regex, note) values
-  ('kopos', 'KOPOS (Ресурс Електро)', '^(kopos|копос)',
+  ('kopos', 'KOPOS/Ресурс-Електро', '^(kopos|копос)',
    'Ціни в EUR (частина в грн) БЕЗ ПДВ за 1000 шт/м; курс — з файлу постачальника')
 on conflict (code) do nothing;
 
