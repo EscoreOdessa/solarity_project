@@ -71,7 +71,7 @@ MIN_DAYS_BETWEEN = 13   # для запуску за розкладом: «ра�
 # file_re — як розпізнати файл прайсу за назвою (нижній регістр)
 # label   — що писати в колонку «Постачальник»
 ETI_DISCOUNT = 0.25      # ETI: −25% від «Ціна в грн з ПДВ»
-CHINT_DISCOUNT = 0.0     # CHINT: знижка вже врахована у файлі
+CHINT_DISCOUNT = 0.30    # CHINT (Ресурс-Електро): −30% від «Ціна Реалізації з ПДВ»
 BDK_DISCOUNT = 0.0       # БДК/DKC: знижка від рекомендованої ціни (поки 0%)
 BDK_VAT = 1.2            # БДК: рекомендована ціна в прайсі БЕЗ ПДВ → ×1.2, як у самому файлі
 
@@ -87,7 +87,7 @@ KABLEX_GROUP_DISCOUNTS = [
 ]
 # KOPOS (Ресурс Електро): прайс у EUR без ПДВ за 1000 шт/м → за 1 шт/м × курс × 1.2.
 # Курс — той, що постачальник вказав у файлі (ЗМІСТ!E13), за ним він і виставляє рахунки.
-KOPOS_DISCOUNT = 0.15    # знижка Ресурс Електро 15% (у базі — escore.pricing_rules)
+KOPOS_DISCOUNT = 0.15    # KOPOS (Ресурс-Електро): −15% (у базі — escore.pricing_rules)
 KOPOS_VAT = 1.2
 
 # Частина цін Kablex — у EUR/USD. Курс: НБУ на день оновлення; якщо НБУ недоступний — ці значення
@@ -95,16 +95,16 @@ FALLBACK_RATES = {"EUR": 50.5, "USD": 45.1}
 
 SUPPLIERS = {
     "eti":    {"file_re": r"^eti",             "label": "ETI/ДС-Електро"},
-    "chint":  {"file_re": r"chint",            "label": "CHINT"},
+    "chint":  {"file_re": r"chint",            "label": "CHINT/Ресурс-Електро"},
     "bdk":    {"file_re": r"^(bdk|бдк|dkc)",   "label": "Прайс БДК (DKC)"},
     "kablex": {"file_re": r"^(kablex|каблекс)", "label": "Kablex"},
-    "kopos":  {"file_re": r"^(kopos|копос)",   "label": "KOPOS (Ресурс Електро)"},
+    "kopos":  {"file_re": r"^(kopos|копос)",   "label": "KOPOS/Ресурс-Електро"},
 }
 
 # Як постачальник може бути записаний у колонці J / «Постачальник»
 SUPPLIER_ALIASES = [
     ("kablex", r"kablex|каблекс"),
-    ("kopos",  r"kopos|копос|ресурс"),
+    ("kopos",  r"kopos|копос"),          # «Ресурс-Електро» постачає і KOPOS, і CHINT — визначаємо за маркою
     ("bdk",    r"bdk|бдк|дкс|dkc"),
     ("chint",  r"chint|чінт|чинт"),
     ("eti",    r"\beti\b|ds-електро|дс-електро|етi|еті"),
@@ -290,7 +290,9 @@ def parse_eti(data: bytes, file_name: str) -> PriceBook:
 
 
 def parse_chint(data: bytes, file_name: str) -> PriceBook:
-    """CHINT: вкладка «Прайс-Лист», «Артикул», «Найменування/Тип», ціна (пріоритет — «зі знижкою»)."""
+    """CHINT: вкладка «Прайс-Лист», «Артикул», «Найменування/Тип», «Ціна Реалізації з ПДВ».
+    Знижку рахуємо самі (CHINT_DISCOUNT): комірка знижки у файлі зазвичай 0%, а якщо її заповнять,
+    «Ціна зі знижкою» дала б подвійну знижку. Колонку «зі знижкою» беремо, лише якщо іншої ціни немає."""
     rows = _rows_any(data, file_name, "прайс-лист")
     book = PriceBook("chint", file_name)
     hdr = c_code = c_name = c_price = c_disc = None
@@ -309,7 +311,7 @@ def parse_chint(data: bytes, file_name: str) -> PriceBook:
                 elif c_price is None and "ціна" in c:
                     c_price = j
             break
-    col = c_disc if c_disc is not None else c_price
+    col = c_price if c_price is not None else c_disc
     if hdr is None or c_name is None or col is None:
         raise ValueError("CHINT: не знайдено рядок заголовків (Артикул / Найменування / Ціна)")
     for r in rows[hdr + 1:]:
