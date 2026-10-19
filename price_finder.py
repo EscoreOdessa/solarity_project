@@ -8,7 +8,7 @@ EScore Energy — Оновлення цін СЕС з прайсів поста�
 
 Алгоритм:
   1. У папці з прайсами (PRICES_FOLDER_ID) для кожного постачальника береться
-     НАЙСВІЖІШИЙ файл (ETI, CHINT, БДК/DKC, Kablex — визначаються за назвою файлу).
+     НАЙСВІЖІШИЙ файл (ETI, CHINT, БДК/DKC, Kablex, KOPOS — визначаються за назвою файлу).
   2. Кожен прайс розбирається у словник «артикул → ціна» з урахуванням знижок.
   3. Для кожної позиції вкладки «Довідник обладнання та цін» визначається прив'язка:
        • колонка J («Kablex — … (арт. MBN232)», «BDK/ДКС — … (арт. 35264)»,
@@ -85,6 +85,11 @@ KABLEX_GROUP_DISCOUNTS = [
     ("реле напряжения", 0.25),   # ZUBR
     ("zubr", 0.25),
 ]
+# KOPOS (Ресурс Електро): прайс у EUR без ПДВ за 1000 шт/м → за 1 шт/м × курс × 1.2.
+# Курс — той, що постачальник вказав у файлі (ЗМІСТ!E13), за ним він і виставляє рахунки.
+KOPOS_DISCOUNT = 0.0     # «Ваша знижка, %» у файлі порожня
+KOPOS_VAT = 1.2
+
 # Частина цін Kablex — у EUR/USD. Курс: НБУ на день оновлення; якщо НБУ недоступний — ці значення
 FALLBACK_RATES = {"EUR": 50.5, "USD": 45.1}
 
@@ -93,11 +98,13 @@ SUPPLIERS = {
     "chint":  {"file_re": r"chint",            "label": "CHINT"},
     "bdk":    {"file_re": r"^(bdk|бдк|dkc)",   "label": "Прайс БДК (DKC)"},
     "kablex": {"file_re": r"^(kablex|каблекс)", "label": "Kablex"},
+    "kopos":  {"file_re": r"^(kopos|копос)",   "label": "KOPOS (Ресурс Електро)"},
 }
 
 # Як постачальник може бути записаний у колонці J / «Постачальник»
 SUPPLIER_ALIASES = [
     ("kablex", r"kablex|каблекс"),
+    ("kopos",  r"kopos|копос|ресурс"),
     ("bdk",    r"bdk|бдк|дкс|dkc"),
     ("chint",  r"chint|чінт|чинт"),
     ("eti",    r"\beti\b|ds-електро|дс-електро|етi|еті"),
@@ -485,7 +492,84 @@ def parse_kablex(data: bytes, file_name: str) -> PriceBook:
     return book
 
 
-PARSERS = {"eti": parse_eti, "chint": parse_chint, "bdk": parse_bdk, "kablex": parse_kablex}
+def parse_kopos(data: bytes, file_name: str) -> PriceBook:
+    """KOPOS (Ресурс Електро): вкладка «Загальний прайс» — «Артикул», «Номенклатура»,
+    «грошова одиниця», «Ціни відпускні БЕЗ ПДВ, 1000 шт/м». Курс EUR — з вкладки «ЗМІСТ»
+    (рядок «Поточний курс»), ціна = база / 1000 × курс × (1 − знижка) × ПДВ."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    rate = None
+    if "ЗМІСТ" in wb.sheetnames:
+        for r in wb["ЗМІСТ"].iter_rows(values_only=True):
+            vals = [c for c in r if c is not None]
+            if any("курс" in str(c).lower() for c in vals):
+                rate = next((float(c) for c in vals if isinstance(c, (int, float))), None)
+                if rate:
+                    break
+    if not rate:
+        rate = get_rates()[0]["EUR"]
+        print(f"⚠ KOPOS: курс у файлі не знайдено — беру {rate:.2f}")
+    ws = next((wb[n] for n in wb.sheetnames if "загальний" in n.lower()), None)
+    if ws is None:
+        raise ValueError("KOPOS: немає вкладки «Загальний прайс»")
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    book = PriceBook("kopos", file_name)
+    hdr = None
+    cols = {}
+    for i, r in enumerate(rows):
+        low = [str(c).strip().lower() if c is not None else "" for c in r]
+        if "артикул" in low and "номенклатура" in low:
+            hdr = i
+            for j, c in enumerate(low):
+                if c == "артикул":
+                    cols["code"] = j
+                elif c == "номенклатура":
+                    cols["name"] = j
+                elif "грошова" in c:
+                    cols["cur"] = j
+                elif "без пдв" in c and "1000" in c:
+                    cols["base"] = j
+                elif c.startswith("зміна ціни"):
+                    cols["note"] = j
+                elif c.startswith("одиниця"):
+                    cols["unit"] = j
+            break
+    if hdr is None or not {"code", "name", "base"} <= cols.keys():
+        raise ValueError("KOPOS: не знайдено заголовки (Артикул / Номенклатура / Ціни БЕЗ ПДВ, 1000 шт/м)")
+
+    def g(r, k):
+        j = cols.get(k)
+        return r[j] if j is not None and j < len(r) else None
+
+    cols["ean"] = cols["code"] - 1      # EAN — колонка ліворуч від артикулу
+    data = [r for r in rows[hdr + 1:] if raw_code(g(r, "code")) and g(r, "name")]
+    seen: Dict[str, int] = {}
+    for r in data:
+        a = norm_code(raw_code(g(r, "code")))
+        seen[a] = seen.get(a, 0) + 1
+    for r in data:
+        art = raw_code(g(r, "code"))
+        name = g(r, "name")
+        # Один артикул буває двічі: чеське виробництво (EUR, EAN 859…) і українське (грн, EAN 482…).
+        # Українську версію ведемо окремою позицією: «1416E_K50D_UA».
+        if seen[norm_code(art)] > 1 and str(g(r, "ean") or "").startswith("482"):
+            art = f"{art}_UA"
+        per1000 = to_float(g(r, "base"))
+        note = g(r, "note")
+        status = str(note).strip() if isinstance(note, str) else ""
+        cur = "EUR" if "eur" in str(g(r, "cur") or "eur").lower() else "UAH"
+        r_ = rate if cur == "EUR" else 1.0
+        base = round(per1000 / 1000, 6) if per1000 and per1000 > 0 else None
+        price = round(base * r_ * (1 - KOPOS_DISCOUNT) * KOPOS_VAT, 2) if base else None
+        if base is None and not status:
+            status = "немає ціни"
+        book.add(PriceItem("kopos", norm_code(art), str(name).strip(), price, base, KOPOS_DISCOUNT,
+                           status, "", cur, r_, art))
+    return book
+
+
+PARSERS = {"eti": parse_eti, "chint": parse_chint, "bdk": parse_bdk, "kablex": parse_kablex,
+           "kopos": parse_kopos}
 
 
 def classify_file(file_name: str) -> Optional[str]:
@@ -522,7 +606,7 @@ class Result:
 
 
 _ART_RE = re.compile(r"\(\s*арт\.?\s*([^)]+?)\s*\)\s*$", re.IGNORECASE)
-_SHORT_RE = re.compile(r"^\s*([^:—\-]+?)\s*[:]\s*(\S+)\s*$")
+_SHORT_RE = re.compile(r"^\s*([^:—\-]+?)\s*[:]\s*(\S.*?)\s*$")   # артикул може містити пробіли (KOPOS: KU 68-45_KA)
 
 
 def parse_mapping(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -612,7 +696,7 @@ def match_row(cr: CatalogRow, books: Dict[str, PriceBook]) -> Result:
 def source_note(res: Result, today: str) -> str:
     it = res.item
     disc = f" −{round(it.discount * 100)}%" if it.discount else ""
-    vat = " ×1.2 ПДВ" if it.supplier == "bdk" and BDK_VAT != 1 else ""
+    vat = " ×1.2 ПДВ" if it.supplier in ("bdk", "kopos") else ""
     cur = f" {it.currency}×{it.rate:.2f}" if it.currency != "UAH" else ""
     calc = f"{fmt(it.base)}{cur}{disc}{vat} = {fmt(it.price)}" if it.base else fmt(it.price)
     book_file = res.item and res.item.supplier
@@ -692,13 +776,25 @@ def load_books_from_drive(creds) -> Dict[str, PriceBook]:
     if not files:
         print("⚠ Папка з прайсами порожня або недоступна сервісному акаунту")
 
+    # Найсвіжіший прайс = найпізніша ДАТА В НАЗВІ файлу; modifiedTime — лише якщо дати немає
+    # (відкрили/поправили старий прайс на Диску → modifiedTime оновився, але прайс від цього не новіший)
+    from db_sync import price_date_from_name
     newest: Dict[str, dict] = {}
-    for f in files:                       # відсортовано від найновішого
+    for f in files:                       # відсортовано від найновішого за modifiedTime
         key = classify_file(f["name"])
-        if key and key not in newest:
-            newest[key] = f
-        elif not key:
+        if not key:
             print(f"   (пропущено — невідомий постачальник: {f['name']})")
+            continue
+        d = price_date_from_name(f["name"])
+        prev = newest.get(key)
+        if prev is None:
+            newest[key] = f
+        else:
+            pd = price_date_from_name(prev["name"])
+            if d and (pd is None or d > pd):
+                newest[key] = f
+        if not d:
+            print(f"   ⚠ У назві «{f['name']}» немає дати РРРР_ММ_ДД — порядок за датою зміни файлу")
 
     books = {}
     for key, f in newest.items():
